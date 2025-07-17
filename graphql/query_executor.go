@@ -15,36 +15,75 @@ import (
 
 func queryExecute(ctx context.Context, d *schema.ResourceData, m interface{}, querySource, variableSource string, usePagination bool) (*GqlQueryResponse, []byte, error) {
 	query := d.Get(querySource).(string)
-	inputVariables := d.Get(variableSource).(map[string]interface{})
+
+	var inputVariables map[string]interface{}
+	rawVars, ok := d.GetOk(variableSource)
+	if ok {
+		if varsStr, isString := rawVars.(string); isString {
+			if varsStr != "" {
+				if err := json.Unmarshal([]byte(varsStr), &inputVariables); err != nil {
+					return nil, nil, fmt.Errorf("failed to unmarshal variables from JSON string for key '%s': %w", variableSource, err)
+				}
+			}
+		} else if varsMap, isMap := rawVars.(map[string]interface{}); isMap {
+			inputVariables = varsMap
+		} else {
+			return nil, nil, fmt.Errorf("unexpected type for variable source '%s': expected json string or map", variableSource)
+		}
+	}
+
 	apiURL := m.(*graphqlProviderConfig).GQLServerUrl
 	headers := m.(*graphqlProviderConfig).RequestHeaders
 	authorizationHeaders := m.(*graphqlProviderConfig).RequestAuthorizationHeaders
 
-	if usePagination {
+	if usePagination && querySource == "read_query" {
 		return executePaginatedQuery(ctx, query, inputVariables, apiURL, headers, authorizationHeaders)
 	}
+
 	return executeSingleQuery(ctx, query, inputVariables, apiURL, headers, authorizationHeaders)
 }
 
 func prepareQueryVariables(inputVariables map[string]interface{}, cursor string) map[string]interface{} {
-	currentVars := make(map[string]interface{})
-
-	// Copy input variables
-	for k, v := range inputVariables {
-		js, isJS := isJSON(v)
-		if isJS {
-			currentVars[k] = js
-		} else {
-			currentVars[k] = v
+	if inputVariables == nil {
+		if cursor != "" {
+			return map[string]interface{}{"after": cursor}
 		}
+		return make(map[string]interface{})
 	}
 
-	// Add cursor for pagination if provided
+	processedVars := recursivelyPrepareVariables(inputVariables).(map[string]interface{})
+
 	if cursor != "" {
-		currentVars["after"] = cursor
+		processedVars["after"] = cursor
 	}
 
-	return currentVars
+	return processedVars
+}
+
+func recursivelyPrepareVariables(data interface{}) interface{} {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		newMap := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			newMap[key] = recursivelyPrepareVariables(val)
+		}
+		return newMap
+	case []interface{}:
+		newSlice := make([]interface{}, len(v))
+		for i, val := range v {
+			newSlice[i] = recursivelyPrepareVariables(val)
+		}
+		return newSlice
+	case string:
+
+		var js interface{}
+		if err := json.Unmarshal([]byte(v), &js); err == nil {
+			return js
+		}
+		return v
+	default:
+		return v
+	}
 }
 
 func executeGraphQLRequest(ctx context.Context, query string, variables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
@@ -116,7 +155,6 @@ func executePaginatedQuery(ctx context.Context, query string, inputVariables map
 
 		allResponses = append(allResponses, *gqlResponse)
 
-		// Extract pageInfo from response
 		pageInfo, ok := findPageInfo(gqlResponse.Data)
 		if !ok {
 			return nil, nil, fmt.Errorf("paginated query enabled but no pageInfo found in response (updated)")
@@ -138,12 +176,8 @@ func executePaginatedQuery(ctx context.Context, query string, inputVariables map
 		lastCursor = endCursor
 	}
 
-	// Merge all responses
 	for _, resp := range allResponses {
-		// Merge the data from each response
 		finalResponseData = append(finalResponseData, resp.Data)
-
-		// Merge any errors
 		finalResponseErrors = append(finalResponseErrors, resp.Errors...)
 	}
 
@@ -174,14 +208,4 @@ func findPageInfo(data map[string]interface{}) (map[string]interface{}, bool) {
 		}
 	}
 	return nil, false
-}
-
-// isJSON will check if s can be interpreted as valid JSON, and return an unmarshalled struct representing the JSON if it can.
-func isJSON(s interface{}) (interface{}, bool) {
-	var js interface{}
-	err := json.Unmarshal([]byte(s.(string)), &js)
-	if err != nil {
-		return nil, false
-	}
-	return js, true
 }
