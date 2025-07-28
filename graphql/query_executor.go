@@ -6,43 +6,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"time"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/logging"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
-func queryExecute(ctx context.Context, d *schema.ResourceData, m interface{}, querySource, variableSource string, usePagination bool) (*GqlQueryResponse, []byte, error) {
-	query := d.Get(querySource).(string)
+// queryExecuteFramework executes a GraphQL query using the new framework patterns
+func queryExecuteFramework(ctx context.Context, config *graphqlProviderConfig, query, variableSource string, usePagination bool) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	tflog.Debug(ctx, "Executing GraphQL query", map[string]any{
+		"query":          query,
+		"variableSource": variableSource,
+		"usePagination":  usePagination,
+	})
 
 	var inputVariables map[string]interface{}
-	rawVars, ok := d.GetOk(variableSource)
-	if ok {
-		if varsStr, isString := rawVars.(string); isString {
-			if varsStr != "" {
-				if err := json.Unmarshal([]byte(varsStr), &inputVariables); err != nil {
-					return nil, nil, fmt.Errorf("failed to unmarshal variables from JSON string for key '%s': %w", variableSource, err)
-				}
-			}
-		} else if varsMap, isMap := rawVars.(map[string]interface{}); isMap {
-			inputVariables = varsMap
-		} else {
-			return nil, nil, fmt.Errorf("unexpected type for variable source '%s': expected json string or map", variableSource)
+	if variableSource != "" {
+		if err := json.Unmarshal([]byte(variableSource), &inputVariables); err != nil {
+			diags.AddError("Variable Parsing Error", fmt.Sprintf("failed to unmarshal variables from JSON string: %v", err))
+			return nil, nil, diags
 		}
 	}
 
-	apiURL := m.(*graphqlProviderConfig).GQLServerUrl
-	headers := m.(*graphqlProviderConfig).RequestHeaders
-	authorizationHeaders := m.(*graphqlProviderConfig).RequestAuthorizationHeaders
-
-	if usePagination && querySource == "read_query" {
-		return executePaginatedQuery(ctx, query, inputVariables, apiURL, headers, authorizationHeaders)
+	if usePagination {
+		return executePaginatedQueryFramework(ctx, query, inputVariables, config)
 	}
 
-	return executeSingleQuery(ctx, query, inputVariables, apiURL, headers, authorizationHeaders)
+	return executeSingleQueryFramework(ctx, query, inputVariables, config)
 }
 
+// prepareQueryVariables prepares variables for GraphQL queries, handling pagination
 func prepareQueryVariables(inputVariables map[string]interface{}, cursor string) map[string]interface{} {
 	if inputVariables == nil {
 		if cursor != "" {
@@ -60,6 +56,7 @@ func prepareQueryVariables(inputVariables map[string]interface{}, cursor string)
 	return processedVars
 }
 
+// recursivelyPrepareVariables recursively processes variables to handle JSON strings
 func recursivelyPrepareVariables(data interface{}) interface{} {
 	switch v := data.(type) {
 	case map[string]interface{}:
@@ -75,7 +72,6 @@ func recursivelyPrepareVariables(data interface{}) interface{} {
 		}
 		return newSlice
 	case string:
-
 		var js interface{}
 		if err := json.Unmarshal([]byte(v), &js); err == nil {
 			return js
@@ -86,7 +82,9 @@ func recursivelyPrepareVariables(data interface{}) interface{} {
 	}
 }
 
-func executeGraphQLRequest(ctx context.Context, query string, variables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
+// executeGraphQLRequestFramework executes a single GraphQL request
+func executeGraphQLRequestFramework(ctx context.Context, query string, variables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
 	var queryBodyBuffer bytes.Buffer
 
 	queryObj := GqlQuery{
@@ -95,117 +93,177 @@ func executeGraphQLRequest(ctx context.Context, query string, variables map[stri
 	}
 
 	if err := json.NewEncoder(&queryBodyBuffer).Encode(queryObj); err != nil {
-		return nil, nil, err
+		diags.AddError("Request Encoding Error", fmt.Sprintf("failed to encode query: %v", err))
+		return nil, nil, diags
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, &queryBodyBuffer)
+	req, err := http.NewRequestWithContext(ctx, "POST", config.GQLServerUrl, &queryBodyBuffer)
 	if err != nil {
-		return nil, nil, err
+		diags.AddError("Request Creation Error", fmt.Sprintf("failed to create request: %v", err))
+		return nil, nil, diags
 	}
 
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	req.Header.Set("Accept", "application/json; charset=utf-8")
-	for key, value := range authorizationHeaders {
-		req.Header.Set(key, value.(string))
-	}
-	for key, value := range headers {
-		req.Header.Set(key, value.(string))
+
+	// Add authorization headers
+	for key, value := range config.RequestAuthorizationHeaders {
+		req.Header.Set(key, fmt.Sprintf("%v", value))
 	}
 
-	client := &http.Client{}
-	if logging.IsDebugOrHigher() {
-		log.Printf("[DEBUG] Enabling HTTP requests/responses tracing")
-		client.Transport = logging.NewTransport("GraphQL", http.DefaultTransport)
+	// Add custom headers
+	for key, value := range config.RequestHeaders {
+		req.Header.Set(key, fmt.Sprintf("%v", value))
 	}
 
+	tflog.Debug(ctx, "Sending GraphQL request", map[string]any{
+		"url":     config.GQLServerUrl,
+		"headers": req.Header,
+	})
+
+	// Create HTTP client with timeouts for better reliability
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, err
+		diags.AddError("Request Execution Error", fmt.Sprintf("failed to execute request: %v", err))
+		return nil, nil, diags
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-
-	var gqlResponse GqlQueryResponse
-	if err := json.Unmarshal(body, &gqlResponse); err != nil {
-		return nil, nil, fmt.Errorf("unable to parse graphql server response: %v ---> %s", err, string(body))
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		diags.AddError("Response Reading Error", fmt.Sprintf("failed to read response body: %v", err))
+		return nil, nil, diags
 	}
 
-	return &gqlResponse, body, nil
+	tflog.Debug(ctx, "Received GraphQL response", map[string]any{
+		"statusCode": resp.StatusCode,
+		"bodyLength": len(bodyBytes),
+	})
+
+	if resp.StatusCode != http.StatusOK {
+		diags.AddError("HTTP Error", fmt.Sprintf("received HTTP %d: %s", resp.StatusCode, string(bodyBytes)))
+		return nil, nil, diags
+	}
+
+	var queryResponse GqlQueryResponse
+	if err := json.Unmarshal(bodyBytes, &queryResponse); err != nil {
+		diags.AddError("Response Parsing Error", fmt.Sprintf("failed to parse response: %v", err))
+		return nil, nil, diags
+	}
+
+	return &queryResponse, bodyBytes, diags
 }
 
-func executeSingleQuery(ctx context.Context, query string, inputVariables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
+// executeSingleQueryFramework executes a single GraphQL query
+func executeSingleQueryFramework(ctx context.Context, query string, inputVariables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
 	variables := prepareQueryVariables(inputVariables, "")
-	return executeGraphQLRequest(ctx, query, variables, apiURL, headers, authorizationHeaders)
+	return executeGraphQLRequestFramework(ctx, query, variables, config)
 }
 
-func executePaginatedQuery(ctx context.Context, query string, inputVariables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
-	var allResponses []GqlQueryResponse
-	var finalResponseData []map[string]interface{}
-	var finalResponseErrors []GqlError
-	var lastCursor string
+// executePaginatedQueryFramework executes a paginated GraphQL query
+func executePaginatedQueryFramework(ctx context.Context, query string, inputVariables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	var allData []map[string]interface{}
+	var cursor string
 
 	for {
-		variables := prepareQueryVariables(inputVariables, lastCursor)
-
-		gqlResponse, _, err := executeGraphQLRequest(ctx, query, variables, apiURL, headers, authorizationHeaders)
-		if err != nil {
-			return nil, nil, err
+		variables := prepareQueryVariables(inputVariables, cursor)
+		queryResponse, _, queryDiags := executeGraphQLRequestFramework(ctx, query, variables, config)
+		if queryDiags.HasError() {
+			diags.Append(queryDiags...)
+			return nil, nil, diags
 		}
 
-		allResponses = append(allResponses, *gqlResponse)
-
-		pageInfo, ok := findPageInfo(gqlResponse.Data)
-		if !ok {
-			return nil, nil, fmt.Errorf("paginated query enabled but no pageInfo found in response (updated)")
+		if len(queryResponse.Errors) > 0 {
+			for _, gqlErr := range queryResponse.Errors {
+				diags.AddError("GraphQL Server Error", gqlErr.Message)
+			}
+			return nil, nil, diags
 		}
 
-		hasNextPage, ok := pageInfo["hasNextPage"].(bool)
-		if !ok {
-			return nil, nil, fmt.Errorf("invalid or missing hasNextPage in pageInfo")
+		// Extract data from response
+		data, hasNextPage, nextCursor := extractPaginatedData(queryResponse.Data)
+		if data != nil {
+			allData = append(allData, data)
 		}
 
 		if !hasNextPage {
 			break
 		}
 
-		endCursor, ok := pageInfo["endCursor"].(string)
-		if !ok {
-			return nil, nil, fmt.Errorf("invalid or missing endCursor in pageInfo")
+		cursor = nextCursor
+		if cursor == "" {
+			break
 		}
-		lastCursor = endCursor
 	}
 
-	for _, resp := range allResponses {
-		finalResponseData = append(finalResponseData, resp.Data)
-		finalResponseErrors = append(finalResponseErrors, resp.Errors...)
+	// Create combined response
+	combinedResponse := &GqlQueryResponse{
+		Data: map[string]interface{}{
+			"paginatedData": allData,
+		},
+		PaginatedResponseData: allData,
 	}
 
-	finalResponse := GqlQueryResponse{
-		PaginatedResponseData: finalResponseData,
-		Errors:                finalResponseErrors,
-	}
-
-	responseBytes, err := json.Marshal(finalResponse)
+	// Marshal the combined response
+	combinedBytes, err := json.Marshal(combinedResponse)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error marshaling merged response: %v", err)
+		diags.AddError("Response Marshaling Error", fmt.Sprintf("failed to marshal combined response: %v", err))
+		return nil, nil, diags
 	}
-	return &finalResponse, responseBytes, nil
+
+	return combinedResponse, combinedBytes, diags
 }
 
-// findPageInfo recursively searches for the "pageInfo" key in a nested map[string]interface{}
-func findPageInfo(data map[string]interface{}) (map[string]interface{}, bool) {
-	for key, value := range data {
-		if key == "pageInfo" {
-			if pageInfo, ok := value.(map[string]interface{}); ok {
-				return pageInfo, true
+// extractPaginatedData extracts data from a paginated response
+func extractPaginatedData(data map[string]interface{}) (map[string]interface{}, bool, string) {
+	if data == nil {
+		return nil, false, ""
+	}
+
+	// Look for common pagination patterns
+	for _, value := range data {
+		if pageInfo, ok := value.(map[string]interface{}); ok {
+			// Check if this looks like a paginated result
+			if _, hasEdges := pageInfo["edges"]; hasEdges {
+				if pageInfoData, ok := pageInfo["pageInfo"].(map[string]interface{}); ok {
+					hasNextPage := false
+					if hasNextPageVal, ok := pageInfoData["hasNextPage"].(bool); ok {
+						hasNextPage = hasNextPageVal
+					}
+
+					endCursor := ""
+					if endCursorVal, ok := pageInfoData["endCursor"].(string); ok {
+						endCursor = endCursorVal
+					}
+
+					return pageInfo, hasNextPage, endCursor
+				}
 			}
 		}
-		if nestedMap, ok := value.(map[string]interface{}); ok {
-			if pageInfo, found := findPageInfo(nestedMap); found {
+	}
+
+	// If no pagination structure found, return the data as-is
+	return data, false, ""
+}
+
+// findPageInfo finds page information in a response
+func findPageInfo(data map[string]interface{}) (map[string]interface{}, bool) {
+	if data == nil {
+		return nil, false
+	}
+
+	// Look for pageInfo in common locations
+	for _, value := range data {
+		if pageInfo, ok := value.(map[string]interface{}); ok {
+			if _, hasPageInfo := pageInfo["pageInfo"]; hasPageInfo {
 				return pageInfo, true
 			}
 		}
 	}
+
 	return nil, false
 }
