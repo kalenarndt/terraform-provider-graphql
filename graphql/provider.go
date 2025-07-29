@@ -34,7 +34,7 @@ type GraphqlProvider struct {
 	version string
 }
 
-// GraphqlProviderModel describes the provider data model.
+// GraphqlProviderModel describes the provider data model
 type GraphqlProviderModel struct {
 	URL                            types.String `tfsdk:"url"`
 	Headers                        types.Map    `tfsdk:"headers"`
@@ -42,11 +42,13 @@ type GraphqlProviderModel struct {
 	OAuth2LoginQueryVariables      types.Map    `tfsdk:"oauth2_login_query_variables"`
 	OAuth2LoginQueryValueAttribute types.String `tfsdk:"oauth2_login_query_value_attribute"`
 	// REST OAuth2 support
-	OAuth2RestURL       types.String `tfsdk:"oauth2_rest_url"`
-	OAuth2RestMethod    types.String `tfsdk:"oauth2_rest_method"`
-	OAuth2RestHeaders   types.Map    `tfsdk:"oauth2_rest_headers"`
-	OAuth2RestBody      types.String `tfsdk:"oauth2_rest_body"`
-	OAuth2RestTokenPath types.String `tfsdk:"oauth2_rest_token_path"`
+	OAuth2RestURL          types.String `tfsdk:"oauth2_rest_url"`
+	OAuth2RestMethod       types.String `tfsdk:"oauth2_rest_method"`
+	OAuth2RestHeaders      types.Map    `tfsdk:"oauth2_rest_headers"`
+	OAuth2RestBody         types.String `tfsdk:"oauth2_rest_body"`
+	OAuth2RestTokenPath    types.String `tfsdk:"oauth2_rest_token_path"`
+	QueryRateLimitDelay    types.String `tfsdk:"query_rate_limit_delay"`
+	MutationRateLimitDelay types.String `tfsdk:"mutation_rate_limit_delay"`
 }
 
 // Metadata returns the provider type name.
@@ -102,6 +104,14 @@ func (p *GraphqlProvider) Schema(ctx context.Context, req provider.SchemaRequest
 			"oauth2_rest_token_path": providerschema.StringAttribute{
 				Optional:    true,
 				Description: "JSON path to extract token from REST OAuth2 response (e.g., 'access_token').",
+			},
+			"query_rate_limit_delay": providerschema.StringAttribute{
+				Optional:    true,
+				Description: "Delay between query requests (e.g., '100ms'). Default: 100ms for queries (10/sec).",
+			},
+			"mutation_rate_limit_delay": providerschema.StringAttribute{
+				Optional:    true,
+				Description: "Delay between mutation requests (e.g., '400ms'). Default: 400ms for mutations (3/sec).",
 			},
 		},
 	}
@@ -185,6 +195,31 @@ func (p *GraphqlProvider) Configure(ctx context.Context, req provider.ConfigureR
 		config.RequestAuthorizationHeaders = map[string]interface{}{
 			"Authorization": "Bearer " + token,
 		}
+	}
+
+	// Handle rate limit delay
+	if !data.QueryRateLimitDelay.IsNull() && !data.QueryRateLimitDelay.IsUnknown() {
+		delay, err := time.ParseDuration(data.QueryRateLimitDelay.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Invalid Query Rate Limit Delay", fmt.Sprintf("failed to parse query_rate_limit_delay: %v", err))
+			return
+		}
+		config.QueryRateLimitDelay = delay
+	} else {
+		// Default to 100ms for queries
+		config.QueryRateLimitDelay = 100 * time.Millisecond
+	}
+
+	if !data.MutationRateLimitDelay.IsNull() && !data.MutationRateLimitDelay.IsUnknown() {
+		delay, err := time.ParseDuration(data.MutationRateLimitDelay.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Invalid Mutation Rate Limit Delay", fmt.Sprintf("failed to parse mutation_rate_limit_delay: %v", err))
+			return
+		}
+		config.MutationRateLimitDelay = delay
+	} else {
+		// Default to 400ms for mutations
+		config.MutationRateLimitDelay = 400 * time.Millisecond
 	}
 
 	// Make the GraphQL client available during DataSource and Resource
@@ -516,4 +551,6 @@ type graphqlProviderConfig struct {
 	GQLServerUrl                string
 	RequestHeaders              map[string]interface{}
 	RequestAuthorizationHeaders map[string]interface{}
+	QueryRateLimitDelay         time.Duration
+	MutationRateLimitDelay      time.Duration
 }

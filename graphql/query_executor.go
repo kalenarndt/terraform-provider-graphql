@@ -7,11 +7,35 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"golang.org/x/time/rate"
 )
+
+// Global rate limiters for coordination across all requests
+var (
+	queryRateLimiter    *rate.Limiter
+	mutationRateLimiter *rate.Limiter
+	rateLimitMutex      sync.Mutex
+)
+
+// initializeRateLimiters initializes the global rate limiters
+func initializeRateLimiters(queryDelay, mutationDelay time.Duration) {
+	rateLimitMutex.Lock()
+	defer rateLimitMutex.Unlock()
+
+	if queryDelay > 0 {
+		queryRateLimiter = rate.NewLimiter(rate.Every(queryDelay), 1)
+	}
+	if mutationDelay > 0 {
+		mutationRateLimiter = rate.NewLimiter(rate.Every(mutationDelay), 1)
+	}
+}
 
 // queryExecuteFramework executes a GraphQL query using the new framework patterns
 func queryExecuteFramework(ctx context.Context, config *graphqlProviderConfig, query, variableSource string, usePagination bool) (*GqlQueryResponse, []byte, diag.Diagnostics) {
@@ -30,6 +54,10 @@ func queryExecuteFramework(ctx context.Context, config *graphqlProviderConfig, q
 			return nil, nil, diags
 		}
 	}
+
+	tflog.Debug(ctx, "Parsed variables", map[string]any{
+		"inputVariables": inputVariables,
+	})
 
 	if usePagination {
 		return executePaginatedQueryFramework(ctx, query, inputVariables, config)
@@ -71,38 +99,153 @@ func recursivelyPrepareVariables(data interface{}) interface{} {
 			newSlice[i] = recursivelyPrepareVariables(val)
 		}
 		return newSlice
-	case string:
-		var js interface{}
-		if err := json.Unmarshal([]byte(v), &js); err == nil {
-			return js
-		}
-		return v
 	default:
 		return v
 	}
 }
 
-// executeGraphQLRequestFramework executes a single GraphQL request
+// executeGraphQLRequestFramework executes a GraphQL request with improved rate limiting support
 func executeGraphQLRequestFramework(ctx context.Context, query string, variables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	var queryBodyBuffer bytes.Buffer
+	maxRetries := 5
+	baseDelay := time.Second
 
-	queryObj := GqlQuery{
-		Query:     query,
-		Variables: variables,
+	// Determine if this is a mutation or query based on the query content
+	isMutation := strings.Contains(strings.ToLower(query), "mutation")
+
+	// Initialize rate limiters if not already done
+	if queryRateLimiter == nil || mutationRateLimiter == nil {
+		initializeRateLimiters(config.QueryRateLimitDelay, config.MutationRateLimitDelay)
 	}
 
-	if err := json.NewEncoder(&queryBodyBuffer).Encode(queryObj); err != nil {
-		diags.AddError("Request Encoding Error", fmt.Sprintf("failed to encode query: %v", err))
+	// Wait for rate limiter before making the request
+	var limiter *rate.Limiter
+	if isMutation {
+		limiter = mutationRateLimiter
+	} else {
+		limiter = queryRateLimiter
+	}
+
+	if limiter != nil {
+		if err := limiter.Wait(ctx); err != nil {
+			diags.AddError("Rate Limiter Error", fmt.Sprintf("failed to wait for rate limiter: %v", err))
+			return nil, nil, diags
+		}
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		queryResponse, bodyBytes, attemptDiags := executeSingleGraphQLRequest(ctx, query, variables, config)
+
+		// If no errors, return success
+		if !attemptDiags.HasError() {
+			return queryResponse, bodyBytes, attemptDiags
+		}
+
+		// Check if this is a rate limit error
+		if isRateLimitError(attemptDiags) {
+			if attempt < maxRetries {
+				// Try to parse retry time from the error response
+				retryDelay := parseRetryDelay(attemptDiags)
+				if retryDelay > 0 {
+					tflog.Debug(ctx, "Rate limited, retrying with API-specified delay", map[string]any{
+						"attempt":    attempt + 1,
+						"retryDelay": retryDelay,
+						"operation":  isMutation,
+					})
+					time.Sleep(retryDelay)
+				} else {
+					// Fallback to exponential backoff with jitter
+					delay := time.Duration(attempt+1) * baseDelay
+					// Add jitter to prevent thundering herd
+					jitter := time.Duration(attempt+1) * 100 * time.Millisecond
+					delay += jitter
+					tflog.Debug(ctx, "Rate limited, retrying with exponential backoff", map[string]any{
+						"attempt":   attempt + 1,
+						"delay":     delay,
+						"operation": isMutation,
+					})
+					time.Sleep(delay)
+				}
+				continue
+			}
+		}
+
+		// Check if this is a business logic error (don't retry these)
+		if isBusinessLogicError(attemptDiags) {
+			tflog.Debug(ctx, "Business logic error, not retrying", map[string]any{
+				"attempt":   attempt + 1,
+				"operation": isMutation,
+			})
+			return queryResponse, bodyBytes, attemptDiags
+		}
+
+		// If not a rate limit error or max retries reached, return the error
+		return queryResponse, bodyBytes, attemptDiags
+	}
+
+	return nil, nil, diags
+}
+
+// parseRetryDelay extracts the retryAfterNS from rate limit error responses
+func parseRetryDelay(diags diag.Diagnostics) time.Duration {
+	for _, d := range diags {
+		if strings.Contains(d.Detail(), "HTTP 429") {
+			// Try to extract retryAfterNS from the error message
+			if strings.Contains(d.Detail(), "retryAfterNS") {
+				// Look for retryAfterNS in the JSON response
+				start := strings.Index(d.Detail(), `"retryAfterNS":`)
+				if start != -1 {
+					start += len(`"retryAfterNS":`)
+					end := strings.Index(d.Detail()[start:], ",")
+					if end == -1 {
+						end = strings.Index(d.Detail()[start:], "}")
+					}
+					if end != -1 {
+						retryStr := strings.TrimSpace(d.Detail()[start : start+end])
+						if retry, err := strconv.ParseInt(retryStr, 10, 64); err == nil {
+							// Convert nanoseconds to duration
+							return time.Duration(retry) * time.Nanosecond
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// executeSingleGraphQLRequest executes a single GraphQL request
+func executeSingleGraphQLRequest(ctx context.Context, query string, variables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	// Prepare request body
+	requestBody := map[string]interface{}{
+		"query":     query,
+		"variables": variables,
+	}
+
+	queryBodyBuffer := &bytes.Buffer{}
+	if err := json.NewEncoder(queryBodyBuffer).Encode(requestBody); err != nil {
+		diags.AddError("Request Encoding Error", fmt.Sprintf("failed to encode request body: %v", err))
 		return nil, nil, diags
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", config.GQLServerUrl, &queryBodyBuffer)
+	tflog.Debug(ctx, "Sending GraphQL request", map[string]any{
+		"url":           config.GQLServerUrl,
+		"headers":       config.RequestHeaders,
+		"variables":     variables,
+		"query":         query,
+		"variablesJSON": string(queryBodyBuffer.Bytes()),
+	})
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", config.GQLServerUrl, queryBodyBuffer)
 	if err != nil {
 		diags.AddError("Request Creation Error", fmt.Sprintf("failed to create request: %v", err))
 		return nil, nil, diags
 	}
 
+	// Set headers
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	req.Header.Set("Accept", "application/json; charset=utf-8")
 
@@ -116,18 +259,11 @@ func executeGraphQLRequestFramework(ctx context.Context, query string, variables
 		req.Header.Set(key, fmt.Sprintf("%v", value))
 	}
 
-	tflog.Debug(ctx, "Sending GraphQL request", map[string]any{
-		"url":     config.GQLServerUrl,
-		"headers": req.Header,
-	})
-
-	// Create HTTP client with timeouts for better reliability
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// Execute request
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		diags.AddError("Request Execution Error", fmt.Sprintf("failed to execute request: %v", err))
+		diags.AddError("HTTP Request Error", fmt.Sprintf("failed to execute request: %v", err))
 		return nil, nil, diags
 	}
 	defer resp.Body.Close()
@@ -155,6 +291,30 @@ func executeGraphQLRequestFramework(ctx context.Context, query string, variables
 	}
 
 	return &queryResponse, bodyBytes, diags
+}
+
+// isRateLimitError checks if the error is a rate limit error (429)
+func isRateLimitError(diags diag.Diagnostics) bool {
+	for _, d := range diags {
+		if strings.Contains(d.Detail(), "HTTP 429") || strings.Contains(d.Detail(), "Rate limit") {
+			return true
+		}
+	}
+	return false
+}
+
+// isBusinessLogicError checks if the error is a business logic error (not rate limit)
+func isBusinessLogicError(diags diag.Diagnostics) bool {
+	for _, d := range diags {
+		detail := d.Detail()
+		if strings.Contains(detail, "Can't enable multiple versions") ||
+			strings.Contains(detail, "already enabled") ||
+			strings.Contains(detail, "already exists") ||
+			strings.Contains(detail, "conflict") {
+			return true
+		}
+	}
+	return false
 }
 
 // executeSingleQueryFramework executes a single GraphQL query
