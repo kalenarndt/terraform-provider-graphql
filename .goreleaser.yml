@@ -4,6 +4,8 @@ project_name: terraform-provider-graphql
 before:
   hooks:
     - go mod download
+    - go generate ./...
+
 builds:
   - env:
       # goreleaser does not work with CGO, it could also complicate
@@ -28,13 +30,37 @@ builds:
     ignore:
       - goos: darwin
         goarch: "386"
-    binary: "{{ .ProjectName }}_{{ .Version }}"
+    binary: "{{ .ProjectName }}"
+    # Terraform provider naming convention
+    hooks:
+      post:
+        - cmd: |
+            # Rename binary to follow Terraform provider naming convention
+            for file in dist/{{ .ProjectName }}_*; do
+              if [[ -f "$file" ]]; then
+                dir=$(dirname "$file")
+                name=$(basename "$file")
+                new_name="terraform-provider-graphql_${name#{{ .ProjectName }}_}"
+                mv "$file" "$dir/$new_name"
+              fi
+            done
+          env:
+            - GOOS={{ .Os }}
+            - GOARCH={{ .Arch }}
+
 archives:
   - format: zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Include the binary and any additional files
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
   algorithm: sha256
+
 signs:
   - artifacts: checksum
     args:
@@ -47,11 +73,18 @@ signs:
       - "${signature}"
       - "--detach-sign"
       - "${artifact}"
+
 release:
   # If you want to manually examine the release before its live, uncomment this line:
   # draft: true
+  # GitHub release configuration
+  github:
+    owner: kalenarndt
+    name: terraform-provider-graphql
+
 snapshot:
   name_template: "{{ .Tag }}-next"
+
 changelog:
   sort: asc
   filters:
@@ -59,3 +92,13 @@ changelog:
       - "^docs:"
       - "^test:"
       - "^lint:"
+      - "^chore:"
+      - "^ci:"
+
+# Docker configuration (optional)
+# docker:
+#   image_templates:
+#     - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}"
+#     - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:latest"
+#   dockerfile: Dockerfile
+#   use: buildx

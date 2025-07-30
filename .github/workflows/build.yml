@@ -1,35 +1,139 @@
-name: build
+name: Build and Release
 
 on:
   push:
-    branches: [master]
+    branches: [master, main]
+    tags: ['v*']
   pull_request:
-    branches: [master]
+    branches: [master, main]
+
+env:
+  GO_VERSION: '1.23.7'
+  GORELEASER_VERSION: 'v1.24.0'
 
 jobs:
-  goreleaser:
+  test:
+    name: Test
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run tests
+        run: go test -v -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+  # lint:
+  #   name: Lint
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Go
+  #       uses: actions/setup-go@v4
+  #       with:
+  #         go-version: ${{ env.GO_VERSION }}
+
+  #     - name: Cache Go modules
+  #       uses: actions/cache@v3
+  #       with:
+  #         path: ~/go/pkg/mod
+  #         key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-go-
+
+  #     - name: golangci-lint
+  #       uses: golangci/golangci-lint-action@v3
+  #       with:
+  #         version: latest
+
+  build:
+    name: Build
+    runs-on: ubuntu-22.04
+    needs: [test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v4
         with:
-          go-version: 1.23.7
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: ${{ env.GORELEASER_VERSION }}
+          args: build --snapshot --clean --single-target
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-22.04
+    needs: [test]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Import GPG key
         id: import_gpg
-        uses: crazy-max/ghaction-import-gpg@v2
+        uses: crazy-max/ghaction-import-gpg@v5
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
 
-      - name: Build
-        uses: goreleaser/goreleaser-action@v2
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
         with:
-          version: 1.5.0
-          args: release --snapshot --skip-validate --skip-publish
+          version: ${{ env.GORELEASER_VERSION }}
+          args: release --clean
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
