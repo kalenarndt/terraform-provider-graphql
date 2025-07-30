@@ -5,9 +5,12 @@ import (
 	"flag"
 	"log"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
-	"github.com/sullivtr/terraform-provider-graphql/graphql"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/kalenarndt/terraform-provider-graphql/graphql"
 )
+
+// Run the docs generation tool, check out the Terraform docs site for more information: https://developer.hashicorp.com/terraform/tutorials/providers-plugin-framework/provider-documents
+//go:generate go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs
 
 func main() {
 	var debugMode bool
@@ -15,15 +18,13 @@ func main() {
 	flag.BoolVar(&debugMode, "debug", false, "set to true to run the provider with support for debuggers like delve")
 	flag.Parse()
 
-	opts := &plugin.ServeOpts{ProviderFunc: graphql.Provider}
-
-	if debugMode {
-		err := plugin.Debug(context.Background(), "registry.terraform.io/sullivtr/graphql", opts)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		return
+	opts := providerserver.ServeOpts{
+		Address: "registry.terraform.io/kalenarndt/graphql",
+		Debug:   debugMode,
 	}
 
-	plugin.Serve(opts)
+	err := providerserver.Serve(context.Background(), graphql.New("dev"), opts)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 }

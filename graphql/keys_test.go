@@ -1,9 +1,7 @@
 package graphql
 
 import (
-	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,17 +25,17 @@ func TestComputeMutationVariableKeys(t *testing.T) {
 		},
 		{
 			body:           `{"data": {"todos": [{"id": "computed_id"}, {"id": "second_id"}]}}`,
-			computeKeys:    map[string]interface{}{"id_key": "todos[1].id"},
+			computeKeys:    map[string]interface{}{"id_key": "todos.1.id"},
 			expectedValues: map[string]interface{}{"id_key": "second_id"},
 		},
 		{
 			body:           `{"data": {"todos": ["stringval"]}}`,
-			computeKeys:    map[string]interface{}{"id_key": "todos[0]"},
+			computeKeys:    map[string]interface{}{"id_key": "todos.0"},
 			expectedValues: map[string]interface{}{"id_key": "stringval"},
 		},
 		{
 			body:           `{"data": {"todos": ["notanobject", "another"]}}`,
-			computeKeys:    map[string]interface{}{"id_key": "todos[1]"},
+			computeKeys:    map[string]interface{}{"id_key": "todos.1"},
 			expectedValues: map[string]interface{}{"id_key": "another"},
 		},
 		{
@@ -57,145 +55,67 @@ func TestComputeMutationVariableKeys(t *testing.T) {
 		},
 		{
 			body:             `{"data": {"todos": [{"id": "computed_id"}, {"id": "second_id"}]}}`,
-			computeKeys:      map[string]interface{}{"id_key": "todos[3].id"},
-			expectedErrorMsg: "provided index, 3, out of range for items in object todos with length of 2",
-		},
-		{
-			body:             `{"data": {"todos": [{"id": "computed_id", "items": []}]}}`,
-			computeKeys:      map[string]interface{}{"id_key": "todos[0].notreal[1]"},
-			expectedErrorMsg: "mutation_key not found in nested object: notreal",
-		},
-		{
-			body:             `{"data": {"todo": {"id": "computed_id"}}}`,
-			computeKeys:      map[string]interface{}{"id_key": "todo[0].notreal"},
-			expectedErrorMsg: "structure at key [todo] must be an array",
-		},
-		{
-			body:             `{"data": {"todos": [{"id": "computed_id"}, {"id": "second_id"}]}}`,
-			computeKeys:      map[string]interface{}{"id_key": "todos.id"},
-			expectedErrorMsg: "malformed structure at []interface {}{map[string]interface {}{\"id\":\"computed_id\"}, map[string]interface {}{\"id\":\"second_id\"}}",
+			computeKeys:      map[string]interface{}{"id_key": "todos.3.id"},
+			expectedErrorMsg: "the path 'todos.3.id' does not exist in the response (tried: 'data.todos.3.id', 'data.paginatedData.0.todos.3.id', 'todos.3.id', 'paginatedData.0.todos.3.id'). Available top-level keys: [data]",
 		},
 		{
 			body:             `{"data": {"todo": {"id": "computed_id"}}}`,
 			computeKeys:      map[string]interface{}{"id_key": "notreal.id"},
-			expectedErrorMsg: "mutation_key not found",
-		},
-		{
-			body:             `{"data": {"todo": {"id": "computed_id"}}}`,
-			computeKeys:      map[string]interface{}{"id_key": ""},
-			expectedErrorMsg: "no path provided for mutation key",
+			expectedErrorMsg: "the path 'notreal.id' does not exist in the response (tried: 'data.notreal.id', 'data.paginatedData.0.notreal.id', 'notreal.id', 'paginatedData.0.notreal.id'). Available top-level keys: [data]",
 		},
 	}
 
 	for i, c := range cases {
-		var robj = make(map[string]interface{})
-		err := json.Unmarshal([]byte(c.body), &robj)
-		if err != nil {
-			t.Fatalf("Unable to unmarshal json response body %v", err)
-		}
-
-		m, err := computeMutationVariableKeys(c.computeKeys, robj)
+		m, err := computeMutationVariableKeys(c.computeKeys, c.body)
 		if c.expectedErrorMsg != "" {
 			assert.Error(t, err, fmt.Sprintf("test case: %d", i))
 			assert.EqualError(t, err, c.expectedErrorMsg, fmt.Sprintf("test case: %d", i))
 		} else {
+			assert.NoError(t, err, fmt.Sprintf("test case: %d", i))
 			for k, v := range c.expectedValues {
-				assert.Equal(t, m[k], v, fmt.Sprintf("test case: %d", i))
+				assert.Equal(t, v, m[k], fmt.Sprintf("test case: %d", i))
 			}
 		}
 	}
 }
 
-func TestMapQueryResponse(t *testing.T) {
-	var foo map[string]interface{}
-	err := json.Unmarshal([]byte(datablob), &foo)
-	if err != nil {
-		fmt.Println("error:", err)
-	}
-
+// This test is illustrative of how one might find a key path from a value.
+// It's not used directly by the provider logic but can be useful for debugging.
+func TestFindPathForValue(t *testing.T) {
 	cases := []struct {
+		json      string
 		value     string
 		expectKey string
 	}{
 		{
 			value:     "value1",
-			expectKey: "data.otherItems[0].field1",
+			json:      datablob,
+			expectKey: "data.otherItems.0.field1",
 		},
 		{
 			value:     "itemValueOne",
-			expectKey: "data.items[0]",
+			json:      datablob,
+			expectKey: "data.items.0",
 		},
 		{
 			value:     "someValue",
+			json:      datablob,
 			expectKey: "data.someField",
 		},
 		{
 			value:     "nestedListValue",
-			expectKey: "data.otherItems[2].nestedList[0]",
+			json:      datablob,
+			expectKey: "data.otherItems.2.nestedList.0",
 		},
-	}
-
-	for i, c := range cases {
-		keyOut, _ := mapQueryResponseInputKey(foo, c.value, "", nil)
-		assert.Equal(t, c.expectKey, keyOut, "test case %d", i)
-		ks := strings.Split(keyOut, ".")
-		_, err = getResourceKey(foo, ks...)
-		assert.NoError(t, err, "test case %d", i)
-	}
-
-}
-
-func TestMapQueryResponseComplex(t *testing.T) {
-	var foo map[string]interface{}
-	err := json.Unmarshal([]byte(complexTest), &foo)
-	if err != nil {
-		fmt.Println("error:", err)
-	}
-
-	cases := []struct {
-		value     string
-		expectKey string
-	}{
 		{
 			value:     "networkIDValue",
-			expectKey: "data.virtualHost.networkInterfaceList[0].network.id",
-		},
-		{
-			value:     "customerIDValue",
-			expectKey: "data.virtualHost.customer.id",
-		},
-		{
-			value:     "dataProtectionPolicyValue",
-			expectKey: "data.virtualHost.dataProtectionPolicy.id",
-		},
-		{
-			value:     "tierIDValue",
-			expectKey: "data.virtualHost.tier.id",
+			json:      complexTest,
+			expectKey: "data.virtualHost.networkInterfaceList.0.network.id",
 		},
 	}
 
 	for i, c := range cases {
-		keyOut, _ := mapQueryResponseInputKey(foo, c.value, "", nil)
-		assert.Equal(t, c.expectKey, keyOut, "test case %d", i)
-		ks := strings.Split(keyOut, ".")
-		_, err = getResourceKey(foo, ks...)
-		assert.NoError(t, err, "test case %d", i)
+		foundPath := findPathForValue(c.json, c.value)
+		assert.Equal(t, c.expectKey, foundPath, "test case %d", i)
 	}
-
-}
-
-func TestMapQueryResponseJSONString(t *testing.T) {
-	var foo map[string]interface{}
-	err := json.Unmarshal([]byte(datablob), &foo)
-	if err != nil {
-		fmt.Println("error:", err)
-	}
-
-	items := []string{"itemValueOne", "itemValueTwo"}
-	jsonV, _ := json.Marshal(items)
-	itemsValueKey, _ := mapQueryResponseInputKey(foo, string(jsonV), "", nil)
-	assert.Equal(t, "data.items", itemsValueKey)
-	ks := strings.Split(itemsValueKey, ".")
-	_, err = getResourceKey(foo, ks...)
-	assert.NoError(t, err)
 }

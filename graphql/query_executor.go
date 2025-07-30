@@ -6,43 +6,67 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/logging"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"golang.org/x/time/rate"
 )
 
-func queryExecute(ctx context.Context, d *schema.ResourceData, m interface{}, querySource, variableSource string, usePagination bool) (*GqlQueryResponse, []byte, error) {
-	query := d.Get(querySource).(string)
+// Global rate limiters for coordination across all requests
+var (
+	queryRateLimiter    *rate.Limiter
+	mutationRateLimiter *rate.Limiter
+	rateLimitMutex      sync.Mutex
+)
+
+// initializeRateLimiters initializes the global rate limiters
+func initializeRateLimiters(queryDelay, mutationDelay time.Duration) {
+	rateLimitMutex.Lock()
+	defer rateLimitMutex.Unlock()
+
+	if queryDelay > 0 {
+		queryRateLimiter = rate.NewLimiter(rate.Every(queryDelay), 1)
+	}
+	if mutationDelay > 0 {
+		mutationRateLimiter = rate.NewLimiter(rate.Every(mutationDelay), 1)
+	}
+}
+
+// queryExecuteFramework executes a GraphQL query using the new framework patterns
+func queryExecuteFramework(ctx context.Context, config *graphqlProviderConfig, query, variableSource string, usePagination bool) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	tflog.Debug(ctx, "Executing GraphQL query", map[string]any{
+		"query":          query,
+		"variableSource": variableSource,
+		"usePagination":  usePagination,
+	})
 
 	var inputVariables map[string]interface{}
-	rawVars, ok := d.GetOk(variableSource)
-	if ok {
-		if varsStr, isString := rawVars.(string); isString {
-			if varsStr != "" {
-				if err := json.Unmarshal([]byte(varsStr), &inputVariables); err != nil {
-					return nil, nil, fmt.Errorf("failed to unmarshal variables from JSON string for key '%s': %w", variableSource, err)
-				}
-			}
-		} else if varsMap, isMap := rawVars.(map[string]interface{}); isMap {
-			inputVariables = varsMap
-		} else {
-			return nil, nil, fmt.Errorf("unexpected type for variable source '%s': expected json string or map", variableSource)
+	if variableSource != "" {
+		if err := json.Unmarshal([]byte(variableSource), &inputVariables); err != nil {
+			diags.AddError("Variable Parsing Error", fmt.Sprintf("failed to unmarshal variables from JSON string: %v", err))
+			return nil, nil, diags
 		}
 	}
 
-	apiURL := m.(*graphqlProviderConfig).GQLServerUrl
-	headers := m.(*graphqlProviderConfig).RequestHeaders
-	authorizationHeaders := m.(*graphqlProviderConfig).RequestAuthorizationHeaders
+	tflog.Debug(ctx, "Parsed variables", map[string]any{
+		"inputVariables": inputVariables,
+	})
 
-	if usePagination && querySource == "read_query" {
-		return executePaginatedQuery(ctx, query, inputVariables, apiURL, headers, authorizationHeaders)
+	if usePagination {
+		return executePaginatedQueryFramework(ctx, query, inputVariables, config)
 	}
 
-	return executeSingleQuery(ctx, query, inputVariables, apiURL, headers, authorizationHeaders)
+	return executeSingleQueryFramework(ctx, query, inputVariables, config)
 }
 
+// prepareQueryVariables prepares variables for GraphQL queries, handling pagination
 func prepareQueryVariables(inputVariables map[string]interface{}, cursor string) map[string]interface{} {
 	if inputVariables == nil {
 		if cursor != "" {
@@ -60,6 +84,7 @@ func prepareQueryVariables(inputVariables map[string]interface{}, cursor string)
 	return processedVars
 }
 
+// recursivelyPrepareVariables recursively processes variables to handle JSON strings
 func recursivelyPrepareVariables(data interface{}) interface{} {
 	switch v := data.(type) {
 	case map[string]interface{}:
@@ -74,138 +99,331 @@ func recursivelyPrepareVariables(data interface{}) interface{} {
 			newSlice[i] = recursivelyPrepareVariables(val)
 		}
 		return newSlice
-	case string:
-
-		var js interface{}
-		if err := json.Unmarshal([]byte(v), &js); err == nil {
-			return js
-		}
-		return v
 	default:
 		return v
 	}
 }
 
-func executeGraphQLRequest(ctx context.Context, query string, variables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
-	var queryBodyBuffer bytes.Buffer
+// executeGraphQLRequestFramework executes a GraphQL request with improved rate limiting support
+func executeGraphQLRequestFramework(ctx context.Context, query string, variables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	maxRetries := 5
+	baseDelay := time.Second
 
-	queryObj := GqlQuery{
-		Query:     query,
-		Variables: variables,
+	// Determine if this is a mutation or query based on the query content
+	isMutation := strings.Contains(strings.ToLower(query), "mutation")
+
+	// Initialize rate limiters if not already done
+	if queryRateLimiter == nil || mutationRateLimiter == nil {
+		initializeRateLimiters(config.QueryRateLimitDelay, config.MutationRateLimitDelay)
 	}
 
-	if err := json.NewEncoder(&queryBodyBuffer).Encode(queryObj); err != nil {
-		return nil, nil, err
+	// Wait for rate limiter before making the request
+	var limiter *rate.Limiter
+	if isMutation {
+		limiter = mutationRateLimiter
+	} else {
+		limiter = queryRateLimiter
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, &queryBodyBuffer)
+	if limiter != nil {
+		if err := limiter.Wait(ctx); err != nil {
+			diags.AddError("Rate Limiter Error", fmt.Sprintf("failed to wait for rate limiter: %v", err))
+			return nil, nil, diags
+		}
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		queryResponse, bodyBytes, attemptDiags := executeSingleGraphQLRequest(ctx, query, variables, config)
+
+		// If no errors, return success
+		if !attemptDiags.HasError() {
+			return queryResponse, bodyBytes, attemptDiags
+		}
+
+		// Check if this is a rate limit error
+		if isRateLimitError(attemptDiags) {
+			if attempt < maxRetries {
+				// Try to parse retry time from the error response
+				retryDelay := parseRetryDelay(attemptDiags)
+				if retryDelay > 0 {
+					tflog.Debug(ctx, "Rate limited, retrying with API-specified delay", map[string]any{
+						"attempt":    attempt + 1,
+						"retryDelay": retryDelay,
+						"operation":  isMutation,
+					})
+					time.Sleep(retryDelay)
+				} else {
+					// Fallback to exponential backoff with jitter
+					delay := time.Duration(attempt+1) * baseDelay
+					// Add jitter to prevent thundering herd
+					jitter := time.Duration(attempt+1) * 100 * time.Millisecond
+					delay += jitter
+					tflog.Debug(ctx, "Rate limited, retrying with exponential backoff", map[string]any{
+						"attempt":   attempt + 1,
+						"delay":     delay,
+						"operation": isMutation,
+					})
+					time.Sleep(delay)
+				}
+				continue
+			}
+		}
+
+		// Check if this is a business logic error (don't retry these)
+		if isBusinessLogicError(attemptDiags) {
+			tflog.Debug(ctx, "Business logic error, not retrying", map[string]any{
+				"attempt":   attempt + 1,
+				"operation": isMutation,
+			})
+			return queryResponse, bodyBytes, attemptDiags
+		}
+
+		// If not a rate limit error or max retries reached, return the error
+		return queryResponse, bodyBytes, attemptDiags
+	}
+
+	return nil, nil, diags
+}
+
+// parseRetryDelay extracts the retryAfterNS from rate limit error responses
+func parseRetryDelay(diags diag.Diagnostics) time.Duration {
+	for _, d := range diags {
+		if strings.Contains(d.Detail(), "HTTP 429") {
+			// Try to extract retryAfterNS from the error message
+			if strings.Contains(d.Detail(), "retryAfterNS") {
+				// Look for retryAfterNS in the JSON response
+				start := strings.Index(d.Detail(), `"retryAfterNS":`)
+				if start != -1 {
+					start += len(`"retryAfterNS":`)
+					end := strings.Index(d.Detail()[start:], ",")
+					if end == -1 {
+						end = strings.Index(d.Detail()[start:], "}")
+					}
+					if end != -1 {
+						retryStr := strings.TrimSpace(d.Detail()[start : start+end])
+						if retry, err := strconv.ParseInt(retryStr, 10, 64); err == nil {
+							// Convert nanoseconds to duration
+							return time.Duration(retry) * time.Nanosecond
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// executeSingleGraphQLRequest executes a single GraphQL request
+func executeSingleGraphQLRequest(ctx context.Context, query string, variables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	// Prepare request body
+	requestBody := map[string]interface{}{
+		"query":     query,
+		"variables": variables,
+	}
+
+	queryBodyBuffer := &bytes.Buffer{}
+	if err := json.NewEncoder(queryBodyBuffer).Encode(requestBody); err != nil {
+		diags.AddError("Request Encoding Error", fmt.Sprintf("failed to encode request body: %v", err))
+		return nil, nil, diags
+	}
+
+	tflog.Debug(ctx, "Sending GraphQL request", map[string]any{
+		"url":           config.GQLServerUrl,
+		"headers":       config.RequestHeaders,
+		"variables":     variables,
+		"query":         query,
+		"variablesJSON": string(queryBodyBuffer.Bytes()),
+	})
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", config.GQLServerUrl, queryBodyBuffer)
 	if err != nil {
-		return nil, nil, err
+		diags.AddError("Request Creation Error", fmt.Sprintf("failed to create request: %v", err))
+		return nil, nil, diags
 	}
 
+	// Set headers
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	req.Header.Set("Accept", "application/json; charset=utf-8")
-	for key, value := range authorizationHeaders {
-		req.Header.Set(key, value.(string))
-	}
-	for key, value := range headers {
-		req.Header.Set(key, value.(string))
+
+	// Add authorization headers
+	for key, value := range config.RequestAuthorizationHeaders {
+		req.Header.Set(key, fmt.Sprintf("%v", value))
 	}
 
-	client := &http.Client{}
-	if logging.IsDebugOrHigher() {
-		log.Printf("[DEBUG] Enabling HTTP requests/responses tracing")
-		client.Transport = logging.NewTransport("GraphQL", http.DefaultTransport)
+	// Add custom headers
+	for key, value := range config.RequestHeaders {
+		req.Header.Set(key, fmt.Sprintf("%v", value))
 	}
 
+	// Execute request
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, err
+		diags.AddError("HTTP Request Error", fmt.Sprintf("failed to execute request: %v", err))
+		return nil, nil, diags
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-
-	var gqlResponse GqlQueryResponse
-	if err := json.Unmarshal(body, &gqlResponse); err != nil {
-		return nil, nil, fmt.Errorf("unable to parse graphql server response: %v ---> %s", err, string(body))
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		diags.AddError("Response Reading Error", fmt.Sprintf("failed to read response body: %v", err))
+		return nil, nil, diags
 	}
 
-	return &gqlResponse, body, nil
+	tflog.Debug(ctx, "Received GraphQL response", map[string]any{
+		"statusCode": resp.StatusCode,
+		"bodyLength": len(bodyBytes),
+	})
+
+	if resp.StatusCode != http.StatusOK {
+		diags.AddError("HTTP Error", fmt.Sprintf("received HTTP %d: %s", resp.StatusCode, string(bodyBytes)))
+		return nil, nil, diags
+	}
+
+	var queryResponse GqlQueryResponse
+	if err := json.Unmarshal(bodyBytes, &queryResponse); err != nil {
+		diags.AddError("Response Parsing Error", fmt.Sprintf("failed to parse response: %v", err))
+		return nil, nil, diags
+	}
+
+	return &queryResponse, bodyBytes, diags
 }
 
-func executeSingleQuery(ctx context.Context, query string, inputVariables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
+// isRateLimitError checks if the error is a rate limit error (429)
+func isRateLimitError(diags diag.Diagnostics) bool {
+	for _, d := range diags {
+		if strings.Contains(d.Detail(), "HTTP 429") || strings.Contains(d.Detail(), "Rate limit") {
+			return true
+		}
+	}
+	return false
+}
+
+// isBusinessLogicError checks if the error is a business logic error (not rate limit)
+func isBusinessLogicError(diags diag.Diagnostics) bool {
+	for _, d := range diags {
+		detail := d.Detail()
+		if strings.Contains(detail, "Can't enable multiple versions") ||
+			strings.Contains(detail, "already enabled") ||
+			strings.Contains(detail, "already exists") ||
+			strings.Contains(detail, "conflict") {
+			return true
+		}
+	}
+	return false
+}
+
+// executeSingleQueryFramework executes a single GraphQL query
+func executeSingleQueryFramework(ctx context.Context, query string, inputVariables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
 	variables := prepareQueryVariables(inputVariables, "")
-	return executeGraphQLRequest(ctx, query, variables, apiURL, headers, authorizationHeaders)
+	return executeGraphQLRequestFramework(ctx, query, variables, config)
 }
 
-func executePaginatedQuery(ctx context.Context, query string, inputVariables map[string]interface{}, apiURL string, headers, authorizationHeaders map[string]interface{}) (*GqlQueryResponse, []byte, error) {
-	var allResponses []GqlQueryResponse
-	var finalResponseData []map[string]interface{}
-	var finalResponseErrors []GqlError
-	var lastCursor string
+// executePaginatedQueryFramework executes a paginated GraphQL query
+func executePaginatedQueryFramework(ctx context.Context, query string, inputVariables map[string]interface{}, config *graphqlProviderConfig) (*GqlQueryResponse, []byte, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	var allData []map[string]interface{}
+	var cursor string
 
 	for {
-		variables := prepareQueryVariables(inputVariables, lastCursor)
-
-		gqlResponse, _, err := executeGraphQLRequest(ctx, query, variables, apiURL, headers, authorizationHeaders)
-		if err != nil {
-			return nil, nil, err
+		variables := prepareQueryVariables(inputVariables, cursor)
+		queryResponse, _, queryDiags := executeGraphQLRequestFramework(ctx, query, variables, config)
+		if queryDiags.HasError() {
+			diags.Append(queryDiags...)
+			return nil, nil, diags
 		}
 
-		allResponses = append(allResponses, *gqlResponse)
-
-		pageInfo, ok := findPageInfo(gqlResponse.Data)
-		if !ok {
-			return nil, nil, fmt.Errorf("paginated query enabled but no pageInfo found in response (updated)")
+		if len(queryResponse.Errors) > 0 {
+			for _, gqlErr := range queryResponse.Errors {
+				diags.AddError("GraphQL Server Error", gqlErr.Message)
+			}
+			return nil, nil, diags
 		}
 
-		hasNextPage, ok := pageInfo["hasNextPage"].(bool)
-		if !ok {
-			return nil, nil, fmt.Errorf("invalid or missing hasNextPage in pageInfo")
+		// Extract data from response
+		data, hasNextPage, nextCursor := extractPaginatedData(queryResponse.Data)
+		if data != nil {
+			allData = append(allData, data)
 		}
 
 		if !hasNextPage {
 			break
 		}
 
-		endCursor, ok := pageInfo["endCursor"].(string)
-		if !ok {
-			return nil, nil, fmt.Errorf("invalid or missing endCursor in pageInfo")
+		cursor = nextCursor
+		if cursor == "" {
+			break
 		}
-		lastCursor = endCursor
 	}
 
-	for _, resp := range allResponses {
-		finalResponseData = append(finalResponseData, resp.Data)
-		finalResponseErrors = append(finalResponseErrors, resp.Errors...)
+	// Create combined response
+	combinedResponse := &GqlQueryResponse{
+		Data: map[string]interface{}{
+			"paginatedData": allData,
+		},
+		PaginatedResponseData: allData,
 	}
 
-	finalResponse := GqlQueryResponse{
-		PaginatedResponseData: finalResponseData,
-		Errors:                finalResponseErrors,
-	}
-
-	responseBytes, err := json.Marshal(finalResponse)
+	// Marshal the combined response
+	combinedBytes, err := json.Marshal(combinedResponse)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error marshaling merged response: %v", err)
+		diags.AddError("Response Marshaling Error", fmt.Sprintf("failed to marshal combined response: %v", err))
+		return nil, nil, diags
 	}
-	return &finalResponse, responseBytes, nil
+
+	return combinedResponse, combinedBytes, diags
 }
 
-// findPageInfo recursively searches for the "pageInfo" key in a nested map[string]interface{}
-func findPageInfo(data map[string]interface{}) (map[string]interface{}, bool) {
-	for key, value := range data {
-		if key == "pageInfo" {
-			if pageInfo, ok := value.(map[string]interface{}); ok {
-				return pageInfo, true
+// extractPaginatedData extracts data from a paginated response
+func extractPaginatedData(data map[string]interface{}) (map[string]interface{}, bool, string) {
+	if data == nil {
+		return nil, false, ""
+	}
+
+	// Look for common pagination patterns
+	for _, value := range data {
+		if pageInfo, ok := value.(map[string]interface{}); ok {
+			// Check if this looks like a paginated result
+			if _, hasEdges := pageInfo["edges"]; hasEdges {
+				if pageInfoData, ok := pageInfo["pageInfo"].(map[string]interface{}); ok {
+					hasNextPage := false
+					if hasNextPageVal, ok := pageInfoData["hasNextPage"].(bool); ok {
+						hasNextPage = hasNextPageVal
+					}
+
+					endCursor := ""
+					if endCursorVal, ok := pageInfoData["endCursor"].(string); ok {
+						endCursor = endCursorVal
+					}
+
+					return pageInfo, hasNextPage, endCursor
+				}
 			}
 		}
-		if nestedMap, ok := value.(map[string]interface{}); ok {
-			if pageInfo, found := findPageInfo(nestedMap); found {
+	}
+
+	// If no pagination structure found, return the data as-is
+	return data, false, ""
+}
+
+// findPageInfo finds page information in a response
+func findPageInfo(data map[string]interface{}) (map[string]interface{}, bool) {
+	if data == nil {
+		return nil, false
+	}
+
+	// Look for pageInfo in common locations
+	for _, value := range data {
+		if pageInfo, ok := value.(map[string]interface{}); ok {
+			if _, hasPageInfo := pageInfo["pageInfo"]; hasPageInfo {
 				return pageInfo, true
 			}
 		}
 	}
+
 	return nil, false
 }
