@@ -18,7 +18,7 @@ clean: ## cleans previously built binaries and test folders
 	@rm -rf ./dist;
 
 build: clean fetch ## publishes in dry run mode
-	$(GOPATH)/bin/goreleaser --skip-publish --snapshot --skip-sign 
+	$(GOPATH)/bin/goreleaser --skip-publish --snapshot --skip-sign
 
 
 .PHONY: test copyplugins
@@ -38,4 +38,23 @@ copyplugins: ## copy plugins to test folders
 test: ## test
 	@cd e2e && $(MAKE) test
 
+lint: ## run linting and code quality checks
+	@./scripts/lint.sh
+
+docs: ## generate documentation
+	@./scripts/generate_docs.sh
+
+build-local: ## build provider locally
+	@./scripts/build.sh
+
 fulltest: build test ## build and test
+
+quality: lint docs ## run all quality checks
+
+refactor: ## refactor code to use helper functions
+	@echo "Refactoring code to use helper functions..."
+	@echo "This will move functions from graphql/resource_graphql_mutation.go to helper files"
+	@echo "Please review the changes and update imports as needed"
+
+test-helpers: ## test helper functions
+	@go test -v ./internal/...

@@ -39,3 +39,17 @@ A [Terraform](https://terraform.io) [GraphQL](https://graphql.org/) provider to 
 MPL-2 - See the included LICENSE file for more details.
 
 
+
+## Documentation
+
+For detailed documentation, see the [docs](./docs) directory:
+
+- [Provider Configuration](./docs/index.md)
+- [Data Sources](./docs/data-sources/)
+- [Resources](./docs/resources/)
+
+To generate documentation locally:
+
+```bash
+./scripts/generate_docs.sh
+```
