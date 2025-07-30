@@ -28,9 +28,20 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
           restore-keys: |
+            ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-
             ${{ runner.os }}-go-
+        continue-on-error: true
+
+      - name: Verify Go modules
+        run: |
+          if ! go mod download; then
+            echo "Cache corrupted, cleaning and retrying..."
+            go clean -modcache
+            rm -rf ~/go/pkg/mod
+            go mod download
+          fi
 
       - name: Run tests
         run: go test -v -coverprofile=coverage.out ./...
@@ -86,9 +97,25 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
           restore-keys: |
+            ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-
             ${{ runner.os }}-go-
+        continue-on-error: true
+
+      - name: Verify Go modules
+        run: |
+          if ! go mod download; then
+            echo "Cache corrupted, cleaning and retrying..."
+            go clean -modcache
+            rm -rf ~/go/pkg/mod
+            go mod download
+          fi
+
+      - name: Clean build artifacts
+        run: |
+          rm -rf dist/ || true
+          rm -rf .goreleaser/ || true
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
@@ -118,9 +145,25 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
           restore-keys: |
+            ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-
             ${{ runner.os }}-go-
+        continue-on-error: true
+
+      - name: Verify Go modules
+        run: |
+          if ! go mod download; then
+            echo "Cache corrupted, cleaning and retrying..."
+            go clean -modcache
+            rm -rf ~/go/pkg/mod
+            go mod download
+          fi
+
+      - name: Clean build artifacts
+        run: |
+          rm -rf dist/ || true
+          rm -rf .goreleaser/ || true
 
       - name: Import GPG key
         id: import_gpg
