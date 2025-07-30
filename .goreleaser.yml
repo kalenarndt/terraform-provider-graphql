@@ -30,23 +30,7 @@ builds:
     ignore:
       - goos: darwin
         goarch: "386"
-    binary: "{{ .ProjectName }}"
-    # Terraform provider naming convention
-    hooks:
-      post:
-        - cmd: |
-            # Rename binary to follow Terraform provider naming convention
-            for file in dist/{{ .ProjectName }}_*; do
-              if [[ -f "$file" ]]; then
-                dir=$(dirname "$file")
-                name=$(basename "$file")
-                new_name="terraform-provider-graphql_${name#{{ .ProjectName }}_}"
-                mv "$file" "$dir/$new_name"
-              fi
-            done
-          env:
-            - GOOS={{ .Os }}
-            - GOARCH={{ .Arch }}
+    binary: "terraform-provider-graphql"
 
 archives:
   - format: zip
