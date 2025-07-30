@@ -24,24 +24,8 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Cache Go modules
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-
-            ${{ runner.os }}-go-
-        continue-on-error: true
-
-      - name: Verify Go modules
-        run: |
-          if ! go mod download; then
-            echo "Cache corrupted, cleaning and retrying..."
-            go clean -modcache
-            rm -rf ~/go/pkg/mod
-            go mod download
-          fi
+      - name: Download dependencies
+        run: go mod download
 
       - name: Run tests
         run: go test -v -coverprofile=coverage.out ./...
@@ -93,24 +77,8 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Cache Go modules
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-
-            ${{ runner.os }}-go-
-        continue-on-error: true
-
-      - name: Verify Go modules
-        run: |
-          if ! go mod download; then
-            echo "Cache corrupted, cleaning and retrying..."
-            go clean -modcache
-            rm -rf ~/go/pkg/mod
-            go mod download
-          fi
+      - name: Download dependencies
+        run: go mod download
 
       - name: Clean build artifacts
         run: |
@@ -141,24 +109,8 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Cache Go modules
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-
-            ${{ runner.os }}-go-
-        continue-on-error: true
-
-      - name: Verify Go modules
-        run: |
-          if ! go mod download; then
-            echo "Cache corrupted, cleaning and retrying..."
-            go clean -modcache
-            rm -rf ~/go/pkg/mod
-            go mod download
-          fi
+      - name: Download dependencies
+        run: go mod download
 
       - name: Clean build artifacts
         run: |
