@@ -218,6 +218,19 @@ func (r *GraphqlMutationResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
+	// If compute_from_read is true, do a read operation first to get computed values
+	if !data.ComputeFromRead.IsNull() && !data.ComputeFromRead.IsUnknown() && data.ComputeFromRead.ValueBool() {
+		tflog.Debug(ctx, "compute_from_read is true, performing read operation first to get computed values")
+		readDiags := r.readResource(ctx, &data, r.config)
+		if readDiags.HasError() {
+			tflog.Debug(ctx, "Read operation failed before create, but continuing", map[string]any{
+				"errors": readDiags,
+			})
+			// Don't fail the create operation if read fails
+			// This can happen if the resource doesn't exist yet
+		}
+	}
+
 	// Execute create operation
 	createBytes, diags := r.executeCreateHook(ctx, &data, r.config)
 	if diags.HasError() {
@@ -724,12 +737,33 @@ func (r *GraphqlMutationResource) executeCreateHook(ctx context.Context, data *G
 		"mutationVariables": mutVarsStr,
 	})
 
-	// Set computed create operation variables
+	// Set computed create operation variables with self-reference replacement
 	// Convert mutation variables to JSON string
 	mutationVarsStr, diags := utils.DynamicToJSONString(ctx, data.MutationVariables)
 	if diags.HasError() {
 		return nil, diags
 	}
+
+	// Parse mutation variables and replace self-references
+	var mutationVars map[string]interface{}
+	if mutationVarsStr != "" {
+		if err := json.Unmarshal([]byte(mutationVarsStr), &mutationVars); err != nil {
+			diags.AddError("Variable Parsing Error", fmt.Sprintf("failed to unmarshal mutation variables: %v", err))
+			return nil, diags
+		}
+
+		// Replace self-references with actual computed values
+		mutationVars = r.replaceSelfReferences(ctx, data, mutationVars)
+
+		// Convert back to JSON
+		replacedVarsBytes, err := json.Marshal(mutationVars)
+		if err != nil {
+			diags.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal replaced mutation variables: %v", err))
+			return nil, diags
+		}
+		mutationVarsStr = string(replacedVarsBytes)
+	}
+
 	data.ComputedCreateOperationVariables = types.StringValue(mutationVarsStr)
 
 	// Set computed update operation variables (empty for create)
@@ -814,12 +848,33 @@ func (r *GraphqlMutationResource) executeUpdateHook(ctx context.Context, data *G
 		variablesToUse = updateVarsStr
 		usePatch = true
 	} else {
-		// Fallback to original mutation variables
+		// Fallback to original mutation variables with self-reference replacement
 		mutationVarsStr, diags := utils.DynamicToJSONString(ctx, data.MutationVariables)
 		if diags.HasError() {
 			return nil, diags
 		}
-		tflog.Debug(ctx, "Using original mutation variables (full payload)", map[string]any{
+
+		// Parse mutation variables and replace self-references
+		var mutationVars map[string]interface{}
+		if mutationVarsStr != "" {
+			if err := json.Unmarshal([]byte(mutationVarsStr), &mutationVars); err != nil {
+				diags.AddError("Variable Parsing Error", fmt.Sprintf("failed to unmarshal mutation variables: %v", err))
+				return nil, diags
+			}
+
+			// Replace self-references with actual computed values
+			mutationVars = r.replaceSelfReferences(ctx, data, mutationVars)
+
+			// Convert back to JSON
+			replacedVarsBytes, err := json.Marshal(mutationVars)
+			if err != nil {
+				diags.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal replaced mutation variables: %v", err))
+				return nil, diags
+			}
+			mutationVarsStr = string(replacedVarsBytes)
+		}
+
+		tflog.Debug(ctx, "Using original mutation variables with self-reference replacement", map[string]any{
 			"mutationVariables": mutationVarsStr,
 		})
 		variablesToUse = mutationVarsStr
@@ -842,13 +897,33 @@ func (r *GraphqlMutationResource) executeUpdateHook(ctx context.Context, data *G
 				"error": errorMsg,
 			})
 
-			// Fallback to original mutation variables
+			// Fallback to original mutation variables with self-reference replacement
 			mutationVarsStr, fallbackDiags := utils.DynamicToJSONString(ctx, data.MutationVariables)
 			if fallbackDiags.HasError() {
 				return nil, fallbackDiags
 			}
 
-			tflog.Debug(ctx, "Retrying with full payload", map[string]any{
+			// Parse mutation variables and replace self-references
+			var mutationVars map[string]interface{}
+			if mutationVarsStr != "" {
+				if err := json.Unmarshal([]byte(mutationVarsStr), &mutationVars); err != nil {
+					diags.AddError("Variable Parsing Error", fmt.Sprintf("failed to unmarshal mutation variables: %v", err))
+					return nil, diags
+				}
+
+				// Replace self-references with actual computed values
+				mutationVars = r.replaceSelfReferences(ctx, data, mutationVars)
+
+				// Convert back to JSON
+				replacedVarsBytes, err := json.Marshal(mutationVars)
+				if err != nil {
+					diags.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal replaced mutation variables: %v", err))
+					return nil, diags
+				}
+				mutationVarsStr = string(replacedVarsBytes)
+			}
+
+			tflog.Debug(ctx, "Retrying with full payload and self-reference replacement", map[string]any{
 				"mutationVariables": mutationVarsStr,
 			})
 
@@ -887,6 +962,9 @@ func (r *GraphqlMutationResource) executeDeleteHook(ctx context.Context, data *G
 			diags.AddError("Delete Variables Error", fmt.Sprintf("Failed to unmarshal delete_mutation_variables: %s", err))
 			return diags
 		}
+
+		// Apply self-referencing replacement to delete variables
+		deleteVars = r.replaceSelfReferences(ctx, data, deleteVars)
 	} else {
 		deleteVars = make(map[string]interface{})
 	}
@@ -1008,10 +1086,16 @@ func (r *GraphqlMutationResource) readResource(ctx context.Context, data *Graphq
 		}
 	}
 
-	// Add the resource ID to the variables if it exists
-	if !data.Id.IsNull() && !data.Id.IsUnknown() {
-		computedVariables["id"] = data.Id.ValueString()
-	}
+	// Note: We don't automatically add the resource ID to read query variables
+	// because read queries are typically used for listing/searching resources,
+	// not for fetching a specific resource by ID. If a specific ID is needed,
+	// it should be explicitly included in the read_query_variables configuration.
+	/*
+		// Add the resource ID to the variables if it exists
+		if !data.Id.IsNull() && !data.Id.IsUnknown() {
+			computedVariables["id"] = data.Id.ValueString()
+		}
+	*/
 
 	// Set computed read operation variables
 	computedVarsMap := make(map[string]attr.Value)
@@ -1198,6 +1282,9 @@ func (r *GraphqlMutationResource) readResource(ctx context.Context, data *Graphq
 		return diags
 	}
 
+	// Note: Self-referencing replacement is handled during mutation execution
+	// to preserve the original data types in the Terraform state
+
 	// Check if we got any meaningful computed values
 	if !data.ComputedValues.IsNull() && !data.ComputedValues.IsUnknown() {
 		elements := make(map[string]types.String)
@@ -1327,8 +1414,20 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 			return fmt.Errorf("failed to convert mutation_variables to JSON: %s", utils.DiagnosticsToString(diags))
 		}
 		if mutVarsStr != "" {
-			if err := json.Unmarshal([]byte(mutVarsStr), &desiredMutationVars); err != nil {
-				return fmt.Errorf("failed to unmarshal mutation_variables: %w", err)
+			// Check if the string is already a JSON object or if it needs to be parsed
+			if strings.HasPrefix(strings.TrimSpace(mutVarsStr), "{") {
+				// It's already JSON, unmarshal it
+				if err := json.Unmarshal([]byte(mutVarsStr), &desiredMutationVars); err != nil {
+					return fmt.Errorf("failed to unmarshal mutation_variables: %w", err)
+				}
+			} else {
+				// It might be a simple string, try to parse it as JSON
+				if err := json.Unmarshal([]byte(mutVarsStr), &desiredMutationVars); err != nil {
+					// If that fails, try to treat it as a simple string value
+					desiredMutationVars = map[string]interface{}{
+						"value": mutVarsStr,
+					}
+				}
 			}
 		}
 	}
@@ -1340,10 +1439,13 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 	// Check if the mutation_variables already contains a patch structure
 	if inputObj, ok := desiredMutationVars["input"].(map[string]interface{}); ok {
 		if _, hasPatch := inputObj["patch"]; hasPatch {
-			tflog.Debug(ctx, "Mutation variables already contain patch structure, using as-is")
-			// Already in patch format, no conversion needed
-			// Still need to set computed update variables to avoid unknown state
-			updateVarsBytes, err := json.Marshal(desiredMutationVars)
+			tflog.Debug(ctx, "Mutation variables already contain patch structure, applying self-referencing replacement")
+
+			// Apply self-referencing replacement before using as-is
+			replacedVars := r.replaceSelfReferences(ctx, data, desiredMutationVars)
+
+			// Already in patch format, use with self-references replaced
+			updateVarsBytes, err := json.Marshal(replacedVars)
 			if err != nil {
 				return fmt.Errorf("failed to marshal existing mutation variables: %w", err)
 			}
@@ -1357,8 +1459,12 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 	if inputObj, ok := desiredMutationVars["input"].(map[string]interface{}); ok {
 		// If the input already has an ID and the structure looks complete, use it as-is
 		if _, hasID := inputObj["id"]; hasID {
-			tflog.Debug(ctx, "Mutation variables already contain complete input structure, using as-is")
-			updateVarsBytes, err := json.Marshal(desiredMutationVars)
+			tflog.Debug(ctx, "Mutation variables already contain complete input structure, applying self-referencing replacement")
+
+			// Apply self-referencing replacement before using as-is
+			replacedVars := r.replaceSelfReferences(ctx, data, desiredMutationVars)
+
+			updateVarsBytes, err := json.Marshal(replacedVars)
 			if err != nil {
 				return fmt.Errorf("failed to marshal existing mutation variables: %w", err)
 			}
@@ -1584,4 +1690,66 @@ func (r *GraphqlMutationResource) markResourceAsDeleted(data *GraphqlMutationRes
 	data.QueryResponse = types.StringValue("")
 	data.ExistingHash = types.StringValue("")
 	data.CurrentRemoteState = types.StringValue("")
+}
+
+// Temporarily removed replaceComputedValues functions to debug provider crash
+
+// replaceSelfReferences replaces self-references like "self.id" with actual computed values
+func (r *GraphqlMutationResource) replaceSelfReferences(ctx context.Context, data *GraphqlMutationResourceModel, variables map[string]interface{}) map[string]interface{} {
+	// Get computed values
+	computedValues := make(map[string]string)
+	if !data.ComputedValues.IsNull() && !data.ComputedValues.IsUnknown() {
+		diags := data.ComputedValues.ElementsAs(ctx, &computedValues, false)
+		if diags.HasError() {
+			tflog.Debug(ctx, "Failed to get computed values for self-replacement", map[string]any{
+				"error": utils.DiagnosticsToString(diags),
+			})
+			return variables
+		}
+	}
+
+	tflog.Debug(ctx, "replaceSelfReferences called", map[string]any{
+		"computedValues": computedValues,
+		"variables":      variables,
+	})
+
+	// Recursively replace self-references
+	result := r.replaceSelfReferencesRecursive(variables, computedValues)
+	if resultMap, ok := result.(map[string]interface{}); ok {
+		return resultMap
+	}
+	return variables
+}
+
+// replaceSelfReferencesRecursive recursively replaces self-references
+func (r *GraphqlMutationResource) replaceSelfReferencesRecursive(data interface{}, computedValues map[string]string) interface{} {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		newMap := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			newMap[key] = r.replaceSelfReferencesRecursive(val, computedValues)
+		}
+		return newMap
+	case []interface{}:
+		newSlice := make([]interface{}, len(v))
+		for i, val := range v {
+			newSlice[i] = r.replaceSelfReferencesRecursive(val, computedValues)
+		}
+		return newSlice
+	case string:
+		// Replace self-references like "self.id", "self.shortId", etc.
+		if strings.HasPrefix(v, "self.") {
+			fieldName := strings.TrimPrefix(v, "self.")
+			if value, exists := computedValues[fieldName]; exists {
+				tflog.Debug(context.Background(), "Replacing self-reference with computed value", map[string]any{
+					"self_reference": v,
+					"computed_value": value,
+				})
+				return value
+			}
+		}
+		return v
+	default:
+		return v
+	}
 }

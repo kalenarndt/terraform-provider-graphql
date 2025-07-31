@@ -84,7 +84,7 @@ func prepareQueryVariables(inputVariables map[string]interface{}, cursor string)
 	return processedVars
 }
 
-// recursivelyPrepareVariables recursively processes variables to handle JSON strings
+// recursivelyPrepareVariables recursively processes variables to handle JSON strings and type conversions
 func recursivelyPrepareVariables(data interface{}) interface{} {
 	switch v := data.(type) {
 	case map[string]interface{}:
@@ -99,6 +99,20 @@ func recursivelyPrepareVariables(data interface{}) interface{} {
 			newSlice[i] = recursivelyPrepareVariables(val)
 		}
 		return newSlice
+	case string:
+		// Try to convert string numbers to integers for GraphQL variables
+		if intVal, err := strconv.Atoi(v); err == nil {
+			return intVal
+		}
+		// Try to convert string numbers to floats for GraphQL variables
+		if floatVal, err := strconv.ParseFloat(v, 64); err == nil {
+			return floatVal
+		}
+		// Try to convert string booleans to booleans for GraphQL variables
+		if boolVal, err := strconv.ParseBool(v); err == nil {
+			return boolVal
+		}
+		return v
 	default:
 		return v
 	}
