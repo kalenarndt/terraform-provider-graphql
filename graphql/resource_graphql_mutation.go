@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -116,8 +117,8 @@ func (r *GraphqlMutationResource) Schema(ctx context.Context, req resource.Schem
 			},
 			"compute_mutation_keys": schema.MapAttribute{
 				ElementType: types.StringType,
-				Required:    true,
-				Description: "A map of keys to paths for extracting values from the API response. Use JSON path syntax (e.g., 'createTodo.id' or 'data.user.id'). These extracted values become available in computed_values and are used for subsequent operations.",
+				Optional:    true,
+				Description: "A map of keys to paths for extracting values from the API response. Use JSON path syntax (e.g., 'createTodo.id' or 'data.user.id'). These extracted values become available in computed_values and are used for subsequent operations. Required unless compute_from_read is true.",
 			},
 			"read_compute_keys": schema.MapAttribute{
 				ElementType: types.StringType,
@@ -215,6 +216,18 @@ func (r *GraphqlMutationResource) Create(ctx context.Context, req resource.Creat
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
 
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Validate that either compute_mutation_keys is provided OR compute_from_read is true
+	hasComputeMutationKeys := !data.ComputeMutationKeys.IsNull() && !data.ComputeMutationKeys.IsUnknown()
+	hasComputeFromRead := !data.ComputeFromRead.IsNull() && !data.ComputeFromRead.IsUnknown() && data.ComputeFromRead.ValueBool()
+
+	if !hasComputeMutationKeys && !hasComputeFromRead {
+		resp.Diagnostics.AddError(
+			"Configuration Error",
+			"Either 'compute_mutation_keys' must be provided or 'compute_from_read' must be set to true",
+		)
 		return
 	}
 
@@ -401,7 +414,7 @@ func (r *GraphqlMutationResource) Read(ctx context.Context, req resource.ReadReq
 							})
 
 							// Store current remote state for drift detection
-							currentStateBytes, _ := json.Marshal(currentRemoteState)
+							currentStateBytes, _ := json.Marshal(normalizeForJSON(currentRemoteState))
 							data.CurrentRemoteState = types.StringValue(string(currentStateBytes))
 
 							if hasDrift {
@@ -411,24 +424,8 @@ func (r *GraphqlMutationResource) Read(ctx context.Context, req resource.ReadReq
 
 								// CRITICAL: Signal drift to Terraform by modifying the mutation_variables
 								// to reflect the current remote state, so Terraform can detect the difference
-								if !data.WrapUpdateInPatch.IsNull() && !data.WrapUpdateInPatch.IsUnknown() && data.WrapUpdateInPatch.ValueBool() {
-									// For patch updates, update the patch field to reflect current state
-									updatedMutationVars := map[string]interface{}{
-										"input": map[string]interface{}{
-											"id":    desiredFields["id"],
-											"patch": currentRemoteState,
-										},
-									}
-									updatedMutationVarsBytes, _ := json.Marshal(updatedMutationVars)
-									data.MutationVariables = types.DynamicValue(types.StringValue(string(updatedMutationVarsBytes)))
-								} else {
-									// For direct updates, update the input field to reflect current state
-									updatedMutationVars := map[string]interface{}{
-										"input": currentRemoteState,
-									}
-									updatedMutationVarsBytes, _ := json.Marshal(updatedMutationVars)
-									data.MutationVariables = types.DynamicValue(types.StringValue(string(updatedMutationVarsBytes)))
-								}
+								// DO NOT modify mutation_variables - it should always reflect user's configuration
+								// The drift detection is handled by ComputedUpdateOperationVariables
 
 								// Compute minimal patch or input for update
 								wrapPatch := false
@@ -452,7 +449,7 @@ func (r *GraphqlMutationResource) Read(ctx context.Context, req resource.ReadReq
 											}
 										}
 									}
-									updateVarsBytes, _ := json.Marshal(updateVars)
+									updateVarsBytes, _ := json.Marshal(normalizeForJSON(updateVars))
 									data.ComputedUpdateOperationVariables = types.StringValue(string(updateVarsBytes))
 									tflog.Info(ctx, "Set ComputedUpdateOperationVariables for patch update (deep diff)", map[string]any{
 										"updateVars": updateVars,
@@ -462,7 +459,7 @@ func (r *GraphqlMutationResource) Read(ctx context.Context, req resource.ReadReq
 									updateVars := map[string]interface{}{
 										"input": changedFields,
 									}
-									updateVarsBytes, _ := json.Marshal(updateVars)
+									updateVarsBytes, _ := json.Marshal(normalizeForJSON(updateVars))
 									data.ComputedUpdateOperationVariables = types.StringValue(string(updateVarsBytes))
 									tflog.Info(ctx, "Set ComputedUpdateOperationVariables for direct update", map[string]any{
 										"updateVars": updateVars,
@@ -507,6 +504,18 @@ func (r *GraphqlMutationResource) Update(ctx context.Context, req resource.Updat
 	// Get the previous state to ensure we have the ID
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Validate that either compute_mutation_keys is provided OR compute_from_read is true
+	hasComputeMutationKeys := !data.ComputeMutationKeys.IsNull() && !data.ComputeMutationKeys.IsUnknown()
+	hasComputeFromRead := !data.ComputeFromRead.IsNull() && !data.ComputeFromRead.IsUnknown() && data.ComputeFromRead.ValueBool()
+
+	if !hasComputeMutationKeys && !hasComputeFromRead {
+		resp.Diagnostics.AddError(
+			"Configuration Error",
+			"Either 'compute_mutation_keys' must be provided or 'compute_from_read' must be set to true",
+		)
 		return
 	}
 
@@ -674,7 +683,7 @@ func (r *GraphqlMutationResource) Update(ctx context.Context, req resource.Updat
 			var queryResponse map[string]interface{}
 			if err := json.Unmarshal([]byte(data.QueryResponse.ValueString()), &queryResponse); err == nil {
 				currentRemoteState := r.extractCurrentStateFromQueryResponse(ctx, queryResponse)
-				currentStateBytes, _ := json.Marshal(currentRemoteState)
+				currentStateBytes, _ := json.Marshal(normalizeForJSON(currentRemoteState))
 				data.CurrentRemoteState = types.StringValue(string(currentStateBytes))
 
 				tflog.Debug(ctx, "Set CurrentRemoteState after update", map[string]any{
@@ -756,7 +765,7 @@ func (r *GraphqlMutationResource) executeCreateHook(ctx context.Context, data *G
 		mutationVars = r.replaceSelfReferences(ctx, data, mutationVars)
 
 		// Convert back to JSON
-		replacedVarsBytes, err := json.Marshal(mutationVars)
+		replacedVarsBytes, err := json.Marshal(normalizeForJSON(mutationVars))
 		if err != nil {
 			diags.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal replaced mutation variables: %v", err))
 			return nil, diags
@@ -775,7 +784,7 @@ func (r *GraphqlMutationResource) executeCreateHook(ctx context.Context, data *G
 			"id": "", // Will be populated after create
 		},
 	}
-	deleteVarsBytes, err := json.Marshal(deleteVars)
+	deleteVarsBytes, err := json.Marshal(normalizeForJSON(deleteVars))
 	if err != nil {
 		diags.AddError("Delete Variables Error", fmt.Sprintf("Failed to marshal delete variables: %s", err))
 		return nil, diags
@@ -866,7 +875,7 @@ func (r *GraphqlMutationResource) executeUpdateHook(ctx context.Context, data *G
 			mutationVars = r.replaceSelfReferences(ctx, data, mutationVars)
 
 			// Convert back to JSON
-			replacedVarsBytes, err := json.Marshal(mutationVars)
+			replacedVarsBytes, err := json.Marshal(normalizeForJSON(mutationVars))
 			if err != nil {
 				diags.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal replaced mutation variables: %v", err))
 				return nil, diags
@@ -915,7 +924,7 @@ func (r *GraphqlMutationResource) executeUpdateHook(ctx context.Context, data *G
 				mutationVars = r.replaceSelfReferences(ctx, data, mutationVars)
 
 				// Convert back to JSON
-				replacedVarsBytes, err := json.Marshal(mutationVars)
+				replacedVarsBytes, err := json.Marshal(normalizeForJSON(mutationVars))
 				if err != nil {
 					diags.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal replaced mutation variables: %v", err))
 					return nil, diags
@@ -969,60 +978,23 @@ func (r *GraphqlMutationResource) executeDeleteHook(ctx context.Context, data *G
 		deleteVars = make(map[string]interface{})
 	}
 
-	// Try to get ID from delete mutation variables first
-	var id string
+	// Only add ID if the user explicitly included an id key in delete_mutation_variables.input
 	if inputMap, ok := deleteVars["input"].(map[string]interface{}); ok {
-		if idVal, hasID := inputMap["id"]; hasID {
-			if idStr, ok := idVal.(string); ok && idStr != "" {
-				id = idStr
+		if _, hasID := inputMap["id"]; hasID {
+			// Try to fill in the id value if it's a placeholder (e.g., "self.id")
+			if idVal, ok := inputMap["id"].(string); ok && (idVal == "self.id" || idVal == "") {
+				id := ""
+				if !data.Id.IsNull() && !data.Id.IsUnknown() {
+					id = data.Id.ValueString()
+				}
+				if id != "" {
+					inputMap["id"] = id
+				}
 			}
 		}
 	}
 
-	// If ID not found in delete variables, try to get it from computed values
-	if id == "" {
-		if data.ComputedValues.IsNull() || data.ComputedValues.IsUnknown() {
-			diags.AddWarning("Missing Computed Values", "Cannot perform delete without computed values from a prior read or create.")
-			return diags
-		}
-
-		computedVals := make(map[string]string)
-		respDiags := data.ComputedValues.ElementsAs(ctx, &computedVals, false)
-		diags.Append(respDiags...)
-		if diags.HasError() {
-			return diags
-		}
-
-		if idVal, ok := computedVals["id"]; ok {
-			id = idVal
-		}
-	}
-
-	// If still no ID, try to get it from the resource's Id field
-	if id == "" {
-		if !data.Id.IsNull() && !data.Id.IsUnknown() {
-			id = data.Id.ValueString()
-		}
-	}
-
-	if id == "" {
-		diags.AddError("Missing ID", "No ID found in delete_mutation_variables, computed values, or resource ID for deletion.")
-		return diags
-	}
-
-	// Ensure the delete variables have the proper structure with input wrapper
-	if _, hasInput := deleteVars["input"]; !hasInput {
-		deleteVars["input"] = make(map[string]interface{})
-	}
-	if inputMap, ok := deleteVars["input"].(map[string]interface{}); ok {
-		inputMap["id"] = id
-	} else {
-		deleteVars["input"] = map[string]interface{}{
-			"id": id,
-		}
-	}
-
-	deleteVarsBytes, err := json.Marshal(deleteVars)
+	deleteVarsBytes, err := json.Marshal(normalizeForJSON(deleteVars))
 	if err != nil {
 		diags.AddError("Delete Variables Error", fmt.Sprintf("Failed to marshal delete variables: %s", err))
 		return diags
@@ -1097,18 +1069,18 @@ func (r *GraphqlMutationResource) readResource(ctx context.Context, data *Graphq
 		}
 	*/
 
-	// Set computed read operation variables
+	// Set computed read operation variables with normalized data
 	computedVarsMap := make(map[string]attr.Value)
 	for k, v := range computedVariables {
 		if str, ok := v.(string); ok {
 			computedVarsMap[k] = types.StringValue(str)
 		} else {
-			bytes, err := json.Marshal(v)
+			normalizedBytes, err := json.Marshal(normalizeForJSON(v))
 			if err != nil {
 				diags.AddError("Variable Marshaling Error", fmt.Sprintf("Failed to marshal computed variable %s: %s", k, err))
 				return diags
 			}
-			computedVarsMap[k] = types.StringValue(string(bytes))
+			computedVarsMap[k] = types.StringValue(string(normalizedBytes))
 		}
 	}
 	data.ComputedReadOperationVariables = types.MapValueMust(types.StringType, computedVarsMap)
@@ -1121,6 +1093,19 @@ func (r *GraphqlMutationResource) readResource(ctx context.Context, data *Graphq
 
 	// Execute read query
 	queryResponse, resBytes, diags := r.queryExecuteFramework(ctx, config, data.ReadQuery.ValueString(), string(readVarsBytes), false)
+
+	// Normalize the API response data immediately after receiving it
+	if queryResponse != nil && queryResponse.Data != nil {
+		normalizedData := normalizeForJSON(queryResponse.Data)
+		queryResponse.Data = normalizedData.(map[string]interface{})
+		// Re-marshal the normalized response for consistency
+		normalizedResBytes, err := json.Marshal(queryResponse)
+		if err != nil {
+			diags.AddError("Response Normalization Error", fmt.Sprintf("Failed to normalize response: %s", err))
+			return diags
+		}
+		resBytes = normalizedResBytes
+	}
 	if diags.HasError() {
 		// Check if it's a "not found" error or other deletion indicators
 		for _, diag := range diags {
@@ -1224,8 +1209,13 @@ func (r *GraphqlMutationResource) readResource(ctx context.Context, data *Graphq
 		})
 	}
 
-	// Set query response
-	data.QueryResponse = types.StringValue(string(resBytes))
+	// Set query response with normalized data
+	normalizedResponseBytes, err := json.Marshal(normalizeForJSON(queryResponse))
+	if err != nil {
+		diags.AddError("Response Normalization Error", fmt.Sprintf("Failed to normalize response: %s", err))
+		return diags
+	}
+	data.QueryResponse = types.StringValue(string(normalizedResponseBytes))
 
 	// Determine keys to use for computation
 	keysToUse := make(map[string]interface{})
@@ -1377,10 +1367,15 @@ func (r *GraphqlMutationResource) computeMutationVariables(queryResponse string,
 		return err
 	}
 
-	// Set computed values
+	// Set computed values with normalized data
 	computedValuesMap := make(map[string]attr.Value)
 	for k, v := range mvks {
-		computedValuesMap[k] = types.StringValue(v)
+		// Normalize the value before storing
+		normalizedBytes, err := json.Marshal(normalizeForJSON(v))
+		if err != nil {
+			return fmt.Errorf("failed to normalize computed value %s: %w", k, err)
+		}
+		computedValuesMap[k] = types.StringValue(string(normalizedBytes))
 	}
 	data.ComputedValues = types.MapValueMust(types.StringType, computedValuesMap)
 	return nil
@@ -1445,7 +1440,7 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 			replacedVars := r.replaceSelfReferences(ctx, data, desiredMutationVars)
 
 			// Already in patch format, use with self-references replaced
-			updateVarsBytes, err := json.Marshal(replacedVars)
+			updateVarsBytes, err := json.Marshal(normalizeForJSON(replacedVars))
 			if err != nil {
 				return fmt.Errorf("failed to marshal existing mutation variables: %w", err)
 			}
@@ -1464,7 +1459,7 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 			// Apply self-referencing replacement before using as-is
 			replacedVars := r.replaceSelfReferences(ctx, data, desiredMutationVars)
 
-			updateVarsBytes, err := json.Marshal(replacedVars)
+			updateVarsBytes, err := json.Marshal(normalizeForJSON(replacedVars))
 			if err != nil {
 				return fmt.Errorf("failed to marshal existing mutation variables: %w", err)
 			}
@@ -1530,7 +1525,7 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 			}
 
 			// Convert to JSON and store in computed update operation variables
-			updateVarsBytes, err := json.Marshal(updateVariables)
+			updateVarsBytes, err := json.Marshal(normalizeForJSON(updateVariables))
 			if err != nil {
 				return fmt.Errorf("failed to marshal update variables: %w", err)
 			}
@@ -1555,7 +1550,7 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 				}
 			}
 
-			updateVarsBytes, err := json.Marshal(updateVariables)
+			updateVarsBytes, err := json.Marshal(normalizeForJSON(updateVariables))
 			if err != nil {
 				return fmt.Errorf("failed to marshal update variables: %w", err)
 			}
@@ -1572,7 +1567,7 @@ func (r *GraphqlMutationResource) prepareUpdatePayload(ctx context.Context, data
 		})
 
 		// Set computed update variables to the original mutation variables to avoid unknown state
-		updateVarsBytes, err := json.Marshal(desiredMutationVars)
+		updateVarsBytes, err := json.Marshal(normalizeForJSON(desiredMutationVars))
 		if err != nil {
 			return fmt.Errorf("failed to marshal original mutation variables: %w", err)
 		}
@@ -1594,7 +1589,8 @@ func (r *GraphqlMutationResource) findChangedFields(ctx context.Context, desired
 
 	// Fields that should not be updated
 	excludedFields := map[string]bool{
-		"type": true, // Connector type cannot be changed after creation
+		"type":               true, // Connector type cannot be changed after creation
+		"mutation_variables": true, // Ignore mutation_variables in drift detection
 	}
 
 	// Use the state comparison helper
@@ -1610,13 +1606,31 @@ func (r *GraphqlMutationResource) findChangedFields(ctx context.Context, desired
 		})
 	}
 
+	// Extract fields from current state, handling both input and patch structures
+	currentFields := current
+	if input, hasInput := current["input"].(map[string]interface{}); hasInput {
+		// If current state has an input structure, check if it has a patch
+		if patch, hasPatch := input["patch"].(map[string]interface{}); hasPatch {
+			currentFields = patch
+			tflog.Debug(ctx, "Extracted fields from current patch structure", map[string]any{
+				"currentPatchFields": currentFields,
+			})
+		} else {
+			// Current state has input structure but no patch, use the input fields directly
+			currentFields = input
+			tflog.Debug(ctx, "Using current input fields directly", map[string]any{
+				"currentInputFields": currentFields,
+			})
+		}
+	}
+
 	// Only include fields that have actually changed
 	for key, desiredValue := range desiredFields {
 		if excludedFields[key] {
 			continue // Skip excluded fields
 		}
 
-		currentValue, exists := current[key]
+		currentValue, exists := currentFields[key]
 		if !exists {
 			// Field doesn't exist in current state, it's a new field
 			changedFields[key] = desiredValue
@@ -1651,6 +1665,17 @@ func (r *GraphqlMutationResource) findChangedFields(ctx context.Context, desired
 
 // isUpdateNeeded determines if an update operation is actually required
 func (r *GraphqlMutationResource) isUpdateNeeded(ctx context.Context, desired, current map[string]interface{}) bool {
+	// Check if this is just a structural change in mutation_variables
+	// If the only difference is in the structure of mutation_variables (input vs patch),
+	// we should ignore it since the actual field values are the same
+	if r.isOnlyStructuralChange(desired, current) {
+		tflog.Debug(ctx, "Ignoring structural change in mutation_variables", map[string]any{
+			"desired": desired,
+			"current": current,
+		})
+		return false
+	}
+
 	changedFields := r.findChangedFields(ctx, desired, current)
 
 	tflog.Debug(ctx, "Update need assessment", map[string]any{
@@ -1661,6 +1686,69 @@ func (r *GraphqlMutationResource) isUpdateNeeded(ctx context.Context, desired, c
 	})
 
 	return len(changedFields) > 0
+}
+
+// isOnlyStructuralChange checks if the only difference between desired and current
+// is the structure of mutation_variables (input vs patch)
+func (r *GraphqlMutationResource) isOnlyStructuralChange(desired, current map[string]interface{}) bool {
+	// Check if both have mutation_variables
+	desiredVars, hasDesiredVars := desired["mutation_variables"].(map[string]interface{})
+	currentVars, hasCurrentVars := current["mutation_variables"].(map[string]interface{})
+
+	if !hasDesiredVars || !hasCurrentVars {
+		return false
+	}
+
+	// Check if one has "input" structure and the other has "patch" structure
+	_, hasDesiredInput := desiredVars["input"]
+	_, hasDesiredPatch := desiredVars["patch"]
+	_, hasCurrentInput := currentVars["input"]
+	_, hasCurrentPatch := currentVars["patch"]
+
+	// If one has input and the other has patch, it's a structural change
+	if (hasDesiredInput && hasCurrentPatch) || (hasDesiredPatch && hasCurrentInput) {
+		// Extract the actual field values from both structures
+		desiredFields := r.extractFieldsFromVariables(desiredVars)
+		currentFields := r.extractFieldsFromVariables(currentVars)
+
+		// Compare the actual field values
+		comparison := utils.NewStateComparison()
+		for key, desiredValue := range desiredFields {
+			if currentValue, exists := currentFields[key]; exists {
+				if !comparison.ValuesEqual(desiredValue, currentValue) {
+					return false // There's an actual value difference
+				}
+			} else {
+				return false // Field doesn't exist in current
+			}
+		}
+
+		// Check if all current fields exist in desired
+		for key := range currentFields {
+			if _, exists := desiredFields[key]; !exists {
+				return false // Field doesn't exist in desired
+			}
+		}
+
+		return true // Only structural difference
+	}
+
+	return false
+}
+
+// extractFieldsFromVariables extracts the actual field values from mutation_variables
+// regardless of whether they're in "input" or "patch" structure
+func (r *GraphqlMutationResource) extractFieldsFromVariables(vars map[string]interface{}) map[string]interface{} {
+	if input, hasInput := vars["input"].(map[string]interface{}); hasInput {
+		if patch, hasPatch := input["patch"].(map[string]interface{}); hasPatch {
+			return patch
+		}
+		return input
+	}
+	if patch, hasPatch := vars["patch"].(map[string]interface{}); hasPatch {
+		return patch
+	}
+	return vars
 }
 
 // generateKeysFromResponse uses the helper to generate keys from the response
@@ -1749,6 +1837,46 @@ func (r *GraphqlMutationResource) replaceSelfReferencesRecursive(data interface{
 			}
 		}
 		return v
+	default:
+		return v
+	}
+}
+
+// normalizeForJSON recursively sorts any []string slices in a map[string]interface{} or []interface{}
+func normalizeForJSON(input interface{}) interface{} {
+	switch v := input.(type) {
+	case []interface{}:
+		// If all elements are strings, sort
+		allStrings := true
+		strSlice := make([]string, len(v))
+		for i, val := range v {
+			s, ok := val.(string)
+			if !ok {
+				allStrings = false
+				break
+			}
+			strSlice[i] = s
+		}
+		if allStrings {
+			sort.Strings(strSlice)
+			sorted := make([]interface{}, len(strSlice))
+			for i, s := range strSlice {
+				sorted[i] = s
+			}
+			return sorted
+		}
+		// Fallback: recursively normalize
+		normalized := make([]interface{}, len(v))
+		for i, val := range v {
+			normalized[i] = normalizeForJSON(val)
+		}
+		return normalized
+	case map[string]interface{}:
+		normalized := make(map[string]interface{})
+		for key, val := range v {
+			normalized[key] = normalizeForJSON(val)
+		}
+		return normalized
 	default:
 		return v
 	}

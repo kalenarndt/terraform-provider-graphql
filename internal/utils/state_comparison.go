@@ -3,6 +3,7 @@ package utils
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -81,6 +82,13 @@ func (sc *StateComparison) ValuesEqual(desired, current interface{}) bool {
 		return true
 	}
 	if desired == nil || current == nil {
+		// Special case: if one is nil and the other is an empty object or object with all null values, consider them equal
+		if desired == nil {
+			return sc.isEffectivelyNull(current)
+		}
+		if current == nil {
+			return sc.isEffectivelyNull(desired)
+		}
 		return false
 	}
 
@@ -131,6 +139,42 @@ func (sc *StateComparison) ValuesEqual(desired, current interface{}) bool {
 	return string(desiredJSON) == string(currentJSON)
 }
 
+// isEffectivelyNull checks if a value is effectively null (empty object or object with all null values)
+func (sc *StateComparison) isEffectivelyNull(value interface{}) bool {
+	if value == nil {
+		return true
+	}
+
+	switch v := value.(type) {
+	case map[string]interface{}:
+		// Check if it's an empty map
+		if len(v) == 0 {
+			return true
+		}
+		// Check if all values in the map are null
+		for _, val := range v {
+			if val != nil {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		// Check if it's an empty slice
+		if len(v) == 0 {
+			return true
+		}
+		// Check if all values in the slice are null
+		for _, val := range v {
+			if val != nil {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // normalizeValue normalizes a value for comparison by handling common edge cases
 func (sc *StateComparison) normalizeValue(value interface{}) interface{} {
 	if value == nil {
@@ -149,7 +193,27 @@ func (sc *StateComparison) normalizeValue(value interface{}) interface{} {
 		}
 		return normalized
 	case []interface{}:
-		// Recursively normalize slice values
+		// If all elements are strings, sort them
+		allStrings := true
+		strSlice := make([]string, len(v))
+		for i, val := range v {
+			s, ok := val.(string)
+			if !ok {
+				allStrings = false
+				break
+			}
+			strSlice[i] = s
+		}
+		if allStrings {
+			sort.Strings(strSlice)
+			// Convert back to []interface{}
+			sorted := make([]interface{}, len(strSlice))
+			for i, s := range strSlice {
+				sorted[i] = s
+			}
+			return sorted
+		}
+		// Fallback: recursively normalize slice values
 		normalized := make([]interface{}, len(v))
 		for i, val := range v {
 			normalized[i] = sc.normalizeValue(val)

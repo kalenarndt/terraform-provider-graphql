@@ -18,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/kalenarndt/terraform-provider-graphql/internal/utils"
 	"github.com/tidwall/gjson"
 )
 
@@ -430,10 +431,9 @@ func (d *GraphqlQueryDataSource) Schema(ctx context.Context, req datasource.Sche
 				Required:    true,
 				Description: "The GraphQL query to execute.",
 			},
-			"query_variables": datasourceschema.MapAttribute{
-				ElementType: types.StringType,
+			"query_variables": datasourceschema.DynamicAttribute{
 				Optional:    true,
-				Description: "Variables for the GraphQL query.",
+				Description: "Variables for the GraphQL query. Can be any valid JSON value (object, array, string, number, boolean, null).",
 			},
 			"query_response": datasourceschema.StringAttribute{
 				Computed:    true,
@@ -484,23 +484,10 @@ func (d *GraphqlQueryDataSource) Read(ctx context.Context, req datasource.ReadRe
 	// Convert query variables to JSON string
 	var variablesJSON string
 	if !data.QueryVariables.IsNull() && !data.QueryVariables.IsUnknown() {
-		elements := make(map[string]types.String)
-		resp.Diagnostics.Append(data.QueryVariables.ElementsAs(ctx, &elements, false)...)
+		variablesJSON, resp.Diagnostics = utils.DynamicToJSONString(ctx, data.QueryVariables)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-
-		variablesMap := make(map[string]interface{})
-		for k, v := range elements {
-			variablesMap[k] = v.ValueString()
-		}
-
-		variablesBytes, err := json.Marshal(variablesMap)
-		if err != nil {
-			resp.Diagnostics.AddError("Variable Marshaling Error", fmt.Sprintf("failed to marshal query variables: %v", err))
-			return
-		}
-		variablesJSON = string(variablesBytes)
 	}
 
 	usePagination := data.Paginated.ValueBool()
@@ -539,11 +526,11 @@ func NewGraphqlQueryDataSource() datasource.DataSource {
 
 // GraphqlQueryDataSourceModel describes the data source data model
 type GraphqlQueryDataSourceModel struct {
-	Query          types.String `tfsdk:"query"`
-	QueryVariables types.Map    `tfsdk:"query_variables"`
-	QueryResponse  types.String `tfsdk:"query_response"`
-	Paginated      types.Bool   `tfsdk:"paginated"`
-	ID             types.String `tfsdk:"id"`
+	Query          types.String  `tfsdk:"query"`
+	QueryVariables types.Dynamic `tfsdk:"query_variables"`
+	QueryResponse  types.String  `tfsdk:"query_response"`
+	Paginated      types.Bool    `tfsdk:"paginated"`
+	ID             types.String  `tfsdk:"id"`
 }
 
 // graphqlProviderConfig holds the provider configuration

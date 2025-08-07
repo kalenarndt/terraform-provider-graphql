@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	datasourceschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/kalenarndt/terraform-provider-graphql/internal/utils"
@@ -133,6 +135,28 @@ func TestNewGraphqlMutationResource(t *testing.T) {
 func TestNewGraphqlQueryDataSource(t *testing.T) {
 	datasource := NewGraphqlQueryDataSource()
 	require.NotNil(t, datasource)
+}
+
+func TestGraphqlQueryDataSource_ComplexVariables(t *testing.T) {
+	// Test that the data source can handle complex query_variables
+	ds := NewGraphqlQueryDataSource()
+	require.NotNil(t, ds)
+
+	// Test schema to ensure query_variables is DynamicAttribute
+	req := datasource.SchemaRequest{}
+	resp := &datasource.SchemaResponse{}
+
+	ds.Schema(context.Background(), req, resp)
+
+	require.NotNil(t, resp.Schema)
+
+	// Check that query_variables is a DynamicAttribute
+	queryVarsAttr, ok := resp.Schema.Attributes["query_variables"]
+	require.True(t, ok)
+
+	// Verify it's a DynamicAttribute (not MapAttribute)
+	_, isDynamic := queryVarsAttr.(datasourceschema.DynamicAttribute)
+	assert.True(t, isDynamic, "query_variables should be a DynamicAttribute")
 }
 
 // Test helper functions
