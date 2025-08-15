@@ -393,6 +393,7 @@ func (p *GraphqlProvider) performRestOAuth2Login(ctx context.Context, data Graph
 func (p *GraphqlProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewGraphqlMutationResource,
+		NewGraphqlMutationV2Resource,
 	}
 }
 
